@@ -1,0 +1,16 @@
+[package]
+name = "cu-backend-niri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cu-core = { path = "../cu-core" }
+cu-protocol = { path = "../cu-protocol" }
+enigo.workspace = true
+image.workspace = true
+libwayshot.workspace = true
+
+[lints]
+workspace = true
