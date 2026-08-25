@@ -1,0 +1,15 @@
+[Unit]
+Description=Computer-use daemon for the isolated Codex GUI desktop
+BindsTo=codex-agent-display.service
+After=codex-agent-display.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:99
+UnsetEnvironment=WAYLAND_DISPLAY XDG_SESSION_TYPE
+ExecStart=%h/.local/bin/cu daemon --backend x11 --display :99
+Restart=on-failure
+RestartSec=2
+
+[Install]
+UpheldBy=codex-agent-display.service

@@ -47,6 +47,19 @@ The daemon does not silently fall back from Wayland to XWayland because the
 XWayland root is not the complete desktop. By default, the socket and retained
 frames live under `$XDG_RUNTIME_DIR/computer-use` with owner-only permissions.
 
+For the local isolated `:99` desktop, install the bundled user unit after
+`scripts/install-dev`:
+
+```sh
+install -Dm644 systemd/codex-agent-cu.service \
+  ~/.config/systemd/user/codex-agent-cu.service
+systemctl --user daemon-reload
+systemctl --user enable --now codex-agent-cu.service
+```
+
+The unit is bound to `codex-agent-display.service` and is upheld by it, so an
+Xvfb restart cannot leave `cu` connected to the old X server.
+
 Observe before acting:
 
 ```sh
