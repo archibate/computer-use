@@ -17,6 +17,7 @@ pub async fn serve(socket: PathBuf, engine: Engine) -> Result<()> {
     prepare_socket(&socket).await?;
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind {}", socket.display()))?;
+    let _socket_guard = SocketGuard(socket.clone());
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to secure {}", socket.display()))?;
 
@@ -29,6 +30,14 @@ pub async fn serve(socket: PathBuf, engine: Engine) -> Result<()> {
                 eprintln!("client error: {error:#}");
             }
         });
+    }
+}
+
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 

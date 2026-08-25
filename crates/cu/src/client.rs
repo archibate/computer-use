@@ -34,17 +34,17 @@ pub async fn request(socket: &Path, request: &RequestEnvelope) -> Result<Respons
 }
 
 fn connection_error(socket: &Path, error: &io::Error) -> anyhow::Error {
-    if matches!(
+    let summary = if matches!(
         error.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     ) {
-        anyhow!(
-            "computer-use daemon is not running at {}\nstart it with: cu daemon",
-            socket.display()
-        )
+        format!("computer-use daemon is unavailable at {}", socket.display())
     } else {
-        anyhow!("failed to connect to {}: {error}", socket.display())
-    }
+        format!("failed to connect to {}: {error}", socket.display())
+    };
+    anyhow!(
+        "{summary}\nstart it separately, then retry: `cu daemon` (auto-detects the desktop); use `cu daemon --help` for an explicit backend override"
+    )
 }
 
 #[cfg(test)]
@@ -58,6 +58,9 @@ mod tests {
             &io::Error::from(io::ErrorKind::NotFound),
         );
 
-        assert!(error.to_string().contains("start it with: cu daemon"));
+        let message = error.to_string();
+        assert!(message.contains("start it separately, then retry"));
+        assert!(message.contains("`cu daemon`"));
+        assert!(message.contains("`cu daemon --help`"));
     }
 }

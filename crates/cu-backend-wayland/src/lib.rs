@@ -1,23 +1,17 @@
 use std::{io::Cursor, thread, time::Duration};
 
-use cu_core::{CapturedFrame, Desktop};
+use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use libwayshot::{OutputInfo, WayshotConnection};
 
-pub struct NiriBackend {
+pub struct WaylandBackend {
     capture: WayshotConnection,
     input: Enigo,
     output_name: String,
     capture_limits: CaptureLimits,
     transform: Option<CoordinateTransform>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CaptureLimits {
-    pub max_width: Option<u32>,
-    pub max_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,15 +21,15 @@ struct CoordinateTransform {
     logical_size: Viewport,
 }
 
-impl NiriBackend {
-    /// Connect to niri's Wayland screencopy and virtual-input protocols.
+impl WaylandBackend {
+    /// Connect to direct Wayland screencopy and virtual-input protocols.
     ///
     /// # Errors
     ///
     /// Returns [`CuError`] when output discovery, capture limits, or either
     /// Wayland capability cannot be initialized safely.
     pub fn new(output_name: Option<&str>, capture_limits: CaptureLimits) -> Result<Self, CuError> {
-        validate_capture_limits(capture_limits)?;
+        capture_limits.validate()?;
         let capture = WayshotConnection::new().map_err(|error| {
             CuError::new(
                 ErrorCode::CaptureFailed,
@@ -226,7 +220,7 @@ impl NiriBackend {
     }
 }
 
-impl Desktop for NiriBackend {
+impl Desktop for WaylandBackend {
     fn capture(&mut self) -> Result<CapturedFrame, CuError> {
         let output = self.output()?;
         let image = self
@@ -307,7 +301,7 @@ fn select_output(outputs: &[String], requested: Option<&str>) -> Result<String, 
     if outputs.is_empty() {
         return Err(CuError::new(
             ErrorCode::TargetGone,
-            "niri exposes no active Wayland outputs",
+            "the Wayland compositor exposes no active outputs",
         ));
     }
     if outputs.len() != 1 {
@@ -334,33 +328,13 @@ fn select_output(outputs: &[String], requested: Option<&str>) -> Result<String, 
     Ok(detected.clone())
 }
 
-fn validate_capture_limits(limits: CaptureLimits) -> Result<(), CuError> {
-    if limits.max_width == Some(0) || limits.max_height == Some(0) {
-        return Err(CuError::new(
-            ErrorCode::InvalidAction,
-            "capture limits must be greater than zero",
-        ));
-    }
-    Ok(())
-}
-
 fn fit_within(image: DynamicImage, limits: CaptureLimits) -> DynamicImage {
     let (width, height) = image.dimensions();
-    let width_ratio = limits
-        .max_width
-        .map_or(1.0, |maximum| f64::from(maximum) / f64::from(width));
-    let height_ratio = limits
-        .max_height
-        .map_or(1.0, |maximum| f64::from(maximum) / f64::from(height));
-    let ratio = width_ratio.min(height_ratio).min(1.0);
-    if ratio >= 1.0 {
+    let fitted = limits.fit(width, height);
+    if fitted.width == width && fitted.height == height {
         return image;
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let resized_width = (f64::from(width) * ratio).round() as u32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let resized_height = (f64::from(height) * ratio).round() as u32;
-    image.resize_exact(resized_width, resized_height, FilterType::Lanczos3)
+    image.resize_exact(fitted.width, fitted.height, FilterType::Lanczos3)
 }
 
 const fn map_button(button: MouseButton) -> Button {

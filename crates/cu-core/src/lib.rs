@@ -7,8 +7,8 @@ use std::{
 };
 
 use cu_protocol::{
-    ActOutcome, ActStatus, CuError, DaemonRequest, DaemonResponse, ErrorCode, Observation,
-    RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy, Viewport,
+    ActOutcome, ActStatus, CoordinateSpace, CuError, DaemonRequest, DaemonResponse, ErrorCode,
+    Observation, RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy, Viewport,
     validate_act_request, validate_settle_policy,
 };
 use uuid::Uuid;
@@ -18,6 +18,55 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureLimits {
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+}
+
+impl CaptureLimits {
+    /// Reject zero-sized capture limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CuError`] when either configured limit is zero.
+    pub fn validate(self) -> Result<(), CuError> {
+        if self.max_width == Some(0) || self.max_height == Some(0) {
+            return Err(CuError::new(
+                ErrorCode::InvalidAction,
+                "capture limits must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn fit(self, width: u32, height: u32) -> Viewport {
+        let mut fitted = Viewport { width, height };
+        if width == 0 || height == 0 {
+            return fitted;
+        }
+        if let Some(max_width) = self.max_width
+            && fitted.width > max_width
+        {
+            fitted.height = scaled_dimension(fitted.height, max_width, fitted.width);
+            fitted.width = max_width;
+        }
+        if let Some(max_height) = self.max_height
+            && fitted.height > max_height
+        {
+            fitted.width = scaled_dimension(fitted.width, max_height, fitted.height);
+            fitted.height = max_height;
+        }
+        fitted
+    }
+}
+
+fn scaled_dimension(value: u32, numerator: u32, denominator: u32) -> u32 {
+    let scaled = u64::from(value) * u64::from(numerator) / u64::from(denominator);
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
 }
 
 pub trait Desktop: Send {
@@ -223,7 +272,7 @@ impl Engine {
             target: frame.target,
             width: frame.width,
             height: frame.height,
-            coordinate_space: "frame_pixels".to_owned(),
+            coordinate_space: CoordinateSpace::FramePixels,
             settled,
             image_path: image_path.to_string_lossy().into_owned(),
         };

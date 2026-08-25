@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+install_root="${CARGO_INSTALL_ROOT:-${HOME:?HOME must be set}/.local}"
+bin_dir="${install_root}/bin"
+source_binary="${project_root}/target/release/cu"
+installed_binary="${bin_dir}/cu"
+
+cargo build --release --locked --manifest-path "${project_root}/Cargo.toml" -p cu
+mkdir -p -- "${bin_dir}"
+
+if [[ -L "${installed_binary}" ]] \
+    && [[ "$(readlink -f -- "${installed_binary}")" == "${source_binary}" ]]; then
+    printf 'cu already points to %s\n' "${source_binary}"
+    exit 0
+fi
+
+if [[ -e "${installed_binary}" || -L "${installed_binary}" ]]; then
+    printf 'refusing to replace existing %s\n' "${installed_binary}" >&2
+    exit 1
+fi
+
+ln -s -- "${source_binary}" "${installed_binary}"
+printf 'installed editable cu: %s -> %s\n' "${installed_binary}" "${source_binary}"
+printf 'after source changes, rebuild with: cargo build --release -p cu\n'

@@ -2,7 +2,8 @@
 members = [
     "crates/cu-protocol",
     "crates/cu-core",
-    "crates/cu-backend-niri",
+    "crates/cu-backend-wayland",
+    "crates/cu-backend-x11",
     "crates/cu",
 ]
 resolver = "2"
@@ -21,13 +22,16 @@ enigo = { version = "0.6.1", default-features = false, features = ["wayland"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 libwayshot = { version = "0.9.0", default-features = false, features = ["png"] }
 rmcp = { version = "3.1.4", features = ["transport-io"] }
+rustix = { version = "1.1", features = ["process"] }
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.23"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.18", features = ["v4"] }
+x11rb = { version = "0.14", default-features = false, features = ["image", "xinput", "xkb", "xtest"] }
+xkeysym = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
