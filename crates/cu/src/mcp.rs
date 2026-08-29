@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cu_protocol::{
-    ActRequest, DaemonRequest, DaemonResponse, ObserveRequest, RequestEnvelope, ResponseEnvelope,
-    ResponseResult,
+    ActOutcome, ActRequest, ActStatus, CuError, DaemonRequest, DaemonResponse, Observation,
+    ObserveRequest, RequestEnvelope, ResponseEnvelope, ResponseResult,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -13,6 +13,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -20,6 +21,54 @@ use uuid::Uuid;
 use crate::client;
 
 const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the frame is unknown. Use only the latest returned frame_id as computer_act.expected_frame_id; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation; ground the next action in that image. Batch actions only when no intermediate inspection is needed. After stale_frame, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct McpObservation {
+    /// Opaque frame identifier required by the next `computer_act` call.
+    frame_id: String,
+    /// PNG width and exclusive upper bound for action x coordinates.
+    width: u32,
+    /// PNG height and exclusive upper bound for action y coordinates.
+    height: u32,
+    /// Whether the screen stayed unchanged for `quiet_ms`; an unsettled frame remains usable.
+    settled: bool,
+}
+
+impl From<Observation> for McpObservation {
+    fn from(observation: Observation) -> Self {
+        Self {
+            frame_id: observation.frame_id,
+            width: observation.width,
+            height: observation.height,
+            settled: observation.settled,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct McpActOutcome {
+    /// Complete or partial execution status.
+    status: ActStatus,
+    /// Number of leading actions that executed successfully.
+    #[schemars(range(max = 16))]
+    executed: usize,
+    /// Failure that stopped a partial batch; absent when status is `ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_error: Option<CuError>,
+    /// Fresh post-action or post-failure frame to use for subsequent reasoning.
+    observation: McpObservation,
+}
+
+impl From<ActOutcome> for McpActOutcome {
+    fn from(outcome: ActOutcome) -> Self {
+        Self {
+            status: outcome.status,
+            executed: outcome.executed,
+            action_error: outcome.action_error,
+            observation: outcome.observation.into(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ComputerUseMcp {
@@ -40,7 +89,7 @@ impl ComputerUseMcp {
 
     #[tool(
         description = "Capture the current desktop after optional visual settling. Returns structured frame metadata plus a PNG image. Call before the first action, after stale_frame, or whenever UI state is uncertain; use its frame_id and image dimensions with computer_act.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<cu_protocol::Observation>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<McpObservation>(),
         annotations(
             title = "Observe computer",
             read_only_hint = true,
@@ -59,7 +108,7 @@ impl ComputerUseMcp {
 
     #[tool(
         description = "Execute 1 to 16 sequential input actions grounded in expected_frame_id. Coordinates are pixels in that frame. Returns structured execution metadata plus a fresh PNG; batch only actions whose intermediate UI does not require inspection.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<cu_protocol::ActOutcome>(),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<McpActOutcome>(),
         annotations(
             title = "Act on computer",
             read_only_hint = false,
@@ -137,11 +186,11 @@ async fn to_tool_result(response: ResponseEnvelope) -> Result<CallToolResult, Mc
         ResponseResult::Error(error) => Ok(structured_error(&error)),
         ResponseResult::Ok(DaemonResponse::Observe(observation)) => {
             let image_path = observation.image_path.clone();
-            image_result(observation, image_path).await
+            image_result(McpObservation::from(observation), image_path).await
         }
         ResponseResult::Ok(DaemonResponse::Act(outcome)) => {
             let image_path = outcome.observation.image_path.clone();
-            image_result(outcome, image_path).await
+            image_result(McpActOutcome::from(outcome), image_path).await
         }
     }
 }
@@ -171,7 +220,7 @@ async fn image_result(
         Err(error) => {
             return Ok(CallToolResult::structured_error(json!({
                 "code": "image_unavailable",
-                "message": format!("failed to read {image_path}: {error}"),
+                "message": format!("failed to read captured PNG: {error}"),
             })));
         }
     };
@@ -299,12 +348,25 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("computer_act"))
         );
+        for omitted in ["image_path", "target", "coordinate_space"] {
+            assert!(
+                observe_output["properties"].get(omitted).is_none(),
+                "observe output exposes {omitted}"
+            );
+        }
         let act_output = act.output_schema.unwrap();
         assert!(
             act_output["properties"]["observation"]["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("subsequent reasoning"))
         );
+        let act_observation_properties = &act_output["$defs"]["McpObservation"]["properties"];
+        for omitted in ["image_path", "target", "coordinate_space"] {
+            assert!(
+                act_observation_properties.get(omitted).is_none(),
+                "act output exposes {omitted}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -345,7 +407,12 @@ mod tests {
             settled: true,
             image_path: image_path.to_string_lossy().into_owned(),
         };
-        let expected = serde_json::to_value(&observation).unwrap();
+        let expected = json!({
+            "frame_id": "f_test_1",
+            "width": 100,
+            "height": 80,
+            "settled": true,
+        });
 
         let result = to_tool_result(ResponseEnvelope {
             request_id: "structured-observe".to_owned(),
@@ -355,9 +422,73 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.is_error, Some(false));
-        assert_eq!(result.structured_content, Some(expected));
+        assert_eq!(result.structured_content, Some(expected.clone()));
         assert_eq!(result.content.len(), 2);
-        assert!(result.content[0].as_text().is_some());
+        let text = result.content[0].as_text().unwrap();
+        assert!(!text.text.contains("image_path"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text.text).unwrap(),
+            expected
+        );
+        assert!(result.content[1].as_image().is_some());
+    }
+
+    #[tokio::test]
+    async fn unavailable_image_error_omits_the_private_path() {
+        let directory = TempDir::new().unwrap();
+        let image_path = directory.path().join("missing-frame.png");
+        let private_path = image_path.to_string_lossy().into_owned();
+
+        let result = image_result(json!({"frame_id": "f_test_missing"}), private_path.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["code"], "image_unavailable");
+        assert!(
+            !structured["message"]
+                .as_str()
+                .unwrap()
+                .contains(&private_path)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_action_omits_the_nested_image_path_and_returns_png() {
+        let directory = TempDir::new().unwrap();
+        let image_path = directory.path().join("frame.png");
+        tokio::fs::write(&image_path, [1, 2, 3]).await.unwrap();
+        let outcome = ActOutcome {
+            status: ActStatus::Ok,
+            executed: 1,
+            action_error: None,
+            observation: Observation {
+                frame_id: "f_test_2".to_owned(),
+                target: "test:screen".to_owned(),
+                width: 100,
+                height: 80,
+                coordinate_space: cu_protocol::CoordinateSpace::FramePixels,
+                settled: true,
+                image_path: image_path.to_string_lossy().into_owned(),
+            },
+        };
+
+        let result = to_tool_result(ResponseEnvelope {
+            request_id: "structured-act".to_owned(),
+            result: ResponseResult::Ok(DaemonResponse::Act(outcome)),
+        })
+        .await
+        .unwrap();
+
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["executed"], 1);
+        assert_eq!(structured["observation"]["frame_id"], "f_test_2");
+        for omitted in ["image_path", "target", "coordinate_space"] {
+            assert!(structured["observation"].get(omitted).is_none());
+        }
+        assert_eq!(result.content.len(), 2);
         assert!(result.content[1].as_image().is_some());
     }
 }

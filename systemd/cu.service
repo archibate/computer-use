@@ -1,7 +1,7 @@
 [Unit]
-Description=Computer-use daemon for the isolated Codex GUI desktop
-BindsTo=codex-agent-display.service
-After=codex-agent-display.service
+Description=Computer-use daemon for an isolated X11 desktop
+BindsTo=cu-display.service
+After=cu-display.service
 
 [Service]
 Type=simple
@@ -12,4 +12,5 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-UpheldBy=codex-agent-display.service
+WantedBy=default.target
+UpheldBy=cu-display.service
