@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cu_protocol::{
-    ActOutcome, ActRequest, ActStatus, CuError, DaemonRequest, DaemonResponse, Observation,
-    ObserveRequest, RequestEnvelope, ResponseEnvelope, ResponseResult,
+    ActOutcome, ActRequest, ActStatus, CuError, DaemonRequest, DaemonResponse, ErrorCode,
+    Observation, ObserveRequest, RequestEnvelope, ResponseEnvelope, ResponseResult,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -46,6 +46,27 @@ impl From<Observation> for McpObservation {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+struct McpActionError {
+    /// Stable error category.
+    code: ErrorCode,
+    /// Human-readable diagnostic and recovery context.
+    message: String,
+    /// Number of leading actions that executed before this failure.
+    #[schemars(range(max = 16))]
+    executed: usize,
+}
+
+impl McpActionError {
+    fn from_protocol(error: CuError, executed: usize) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            executed,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 struct McpActOutcome {
     /// Complete or partial execution status.
     status: ActStatus,
@@ -54,18 +75,24 @@ struct McpActOutcome {
     executed: usize,
     /// Failure that stopped a partial batch; absent when status is `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    action_error: Option<CuError>,
+    action_error: Option<McpActionError>,
     /// Fresh post-action or post-failure frame to use for subsequent reasoning.
     observation: McpObservation,
 }
 
 impl From<ActOutcome> for McpActOutcome {
     fn from(outcome: ActOutcome) -> Self {
+        let ActOutcome {
+            status,
+            executed,
+            action_error,
+            observation,
+        } = outcome;
         Self {
-            status: outcome.status,
-            executed: outcome.executed,
-            action_error: outcome.action_error,
-            observation: outcome.observation.into(),
+            status,
+            executed,
+            action_error: action_error.map(|error| McpActionError::from_protocol(error, executed)),
+            observation: observation.into(),
         }
     }
 }
@@ -367,6 +394,14 @@ mod tests {
                 "act output exposes {omitted}"
             );
         }
+        let action_error_executed =
+            &act_output["$defs"]["McpActionError"]["properties"]["executed"];
+        assert_eq!(action_error_executed["type"], "integer");
+        assert!(
+            act_output["$defs"]["McpActionError"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "executed"))
+        );
     }
 
     #[tokio::test]
@@ -488,6 +523,47 @@ mod tests {
         for omitted in ["image_path", "target", "coordinate_space"] {
             assert!(structured["observation"].get(omitted).is_none());
         }
+        assert_eq!(result.content.len(), 2);
+        assert!(result.content[1].as_image().is_some());
+    }
+
+    #[tokio::test]
+    async fn partial_action_returns_a_required_integer_error_count() {
+        let directory = TempDir::new().unwrap();
+        let image_path = directory.path().join("frame.png");
+        tokio::fs::write(&image_path, [1, 2, 3]).await.unwrap();
+        let outcome = ActOutcome {
+            status: ActStatus::Partial,
+            executed: 1,
+            action_error: Some(
+                CuError::new(ErrorCode::InputFailed, "failed after the first action")
+                    .with_executed(1),
+            ),
+            observation: Observation {
+                frame_id: "f_test_partial".to_owned(),
+                target: "test:screen".to_owned(),
+                width: 100,
+                height: 80,
+                coordinate_space: cu_protocol::CoordinateSpace::FramePixels,
+                settled: true,
+                image_path: image_path.to_string_lossy().into_owned(),
+            },
+        };
+
+        let result = to_tool_result(ResponseEnvelope {
+            request_id: "structured-partial-act".to_owned(),
+            result: ResponseResult::Ok(DaemonResponse::Act(outcome)),
+        })
+        .await
+        .unwrap();
+
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "partial");
+        assert_eq!(structured["executed"], 1);
+        assert_eq!(structured["action_error"]["code"], "input_failed");
+        assert_eq!(structured["action_error"]["executed"], 1);
+        assert!(structured["action_error"]["executed"].is_number());
+        assert_eq!(structured["observation"]["frame_id"], "f_test_partial");
         assert_eq!(result.content.len(), 2);
         assert!(result.content[1].as_image().is_some());
     }
