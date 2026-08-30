@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::client;
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the frame is unknown. Use only the latest returned frame_id as computer_act.expected_frame_id; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation; ground the next action in that image. Batch actions only when no intermediate inspection is needed. After stale_frame, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the frame is unknown. Use only the latest returned frame_id as computer_act.expected_frame_id; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation; ground the next action in that image. Batch actions only when no intermediate inspection is needed. After stale_frame, observe again. If a cached action replay says image_expired, the recorded action already executed: do not repeat it; observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct McpObservation {
@@ -76,8 +76,17 @@ struct McpActOutcome {
     /// Failure that stopped a partial batch; absent when status is `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
     action_error: Option<McpActionError>,
-    /// Fresh post-action or post-failure frame to use for subsequent reasoning.
-    observation: McpObservation,
+    /// True only when a cached replay outlived its screenshot; observe again without repeating it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    image_expired: bool,
+    /// Fresh post-action or post-failure frame, absent only when `image_expired` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<McpObservation>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<ActOutcome> for McpActOutcome {
@@ -86,13 +95,15 @@ impl From<ActOutcome> for McpActOutcome {
             status,
             executed,
             action_error,
+            image_expired,
             observation,
         } = outcome;
         Self {
             status,
             executed,
             action_error: action_error.map(|error| McpActionError::from_protocol(error, executed)),
-            observation: observation.into(),
+            image_expired,
+            observation: observation.map(Into::into),
         }
     }
 }
@@ -216,8 +227,19 @@ async fn to_tool_result(response: ResponseEnvelope) -> Result<CallToolResult, Mc
             image_result(McpObservation::from(observation), image_path).await
         }
         ResponseResult::Ok(DaemonResponse::Act(outcome)) => {
-            let image_path = outcome.observation.image_path.clone();
-            image_result(McpActOutcome::from(outcome), image_path).await
+            let image_path = outcome
+                .observation
+                .as_ref()
+                .map(|observation| observation.image_path.clone());
+            let metadata = McpActOutcome::from(outcome);
+            match image_path {
+                Some(image_path) => image_result(metadata, image_path).await,
+                None if metadata.image_expired => Ok(structured_result(metadata)),
+                None => Ok(CallToolResult::structured_error(json!({
+                    "code": "internal",
+                    "message": "action result omitted its observation",
+                }))),
+            }
         }
     }
 }
@@ -226,6 +248,16 @@ fn structured_error(error: &impl Serialize) -> CallToolResult {
     match serde_json::to_value(error) {
         Ok(value) => CallToolResult::structured_error(value),
         Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+    }
+}
+
+fn structured_result(metadata: impl Serialize) -> CallToolResult {
+    match serde_json::to_value(metadata) {
+        Ok(value) => CallToolResult::structured(value),
+        Err(error) => CallToolResult::structured_error(json!({
+            "code": "internal",
+            "message": format!("failed to encode structured result: {error}"),
+        })),
     }
 }
 
@@ -385,7 +417,12 @@ mod tests {
         assert!(
             act_output["properties"]["observation"]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("subsequent reasoning"))
+                .is_some_and(|description| description.contains("image_expired"))
+        );
+        assert!(
+            act_output["properties"]["image_expired"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("without repeating"))
         );
         let act_observation_properties = &act_output["$defs"]["McpObservation"]["properties"];
         for omitted in ["image_path", "target", "coordinate_space"] {
@@ -402,6 +439,32 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "executed"))
         );
+    }
+
+    #[test]
+    fn normal_action_result_contains_every_schema_required_field() {
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"));
+        let act_output = tool(&server, "computer_act").output_schema.unwrap();
+        let normal = serde_json::to_value(McpActOutcome {
+            status: ActStatus::Ok,
+            executed: 1,
+            action_error: None,
+            image_expired: false,
+            observation: Some(McpObservation {
+                frame_id: "f_schema".to_owned(),
+                width: 100,
+                height: 80,
+                settled: true,
+            }),
+        })
+        .unwrap();
+        for required in act_output["required"].as_array().unwrap() {
+            let required = required.as_str().unwrap();
+            assert!(
+                normal.get(required).is_some(),
+                "normal action result omits schema-required field {required}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -498,7 +561,8 @@ mod tests {
             status: ActStatus::Ok,
             executed: 1,
             action_error: None,
-            observation: Observation {
+            image_expired: false,
+            observation: Some(Observation {
                 frame_id: "f_test_2".to_owned(),
                 target: "test:screen".to_owned(),
                 width: 100,
@@ -506,7 +570,7 @@ mod tests {
                 coordinate_space: cu_protocol::CoordinateSpace::FramePixels,
                 settled: true,
                 image_path: image_path.to_string_lossy().into_owned(),
-            },
+            }),
         };
 
         let result = to_tool_result(ResponseEnvelope {
@@ -539,7 +603,8 @@ mod tests {
                 CuError::new(ErrorCode::InputFailed, "failed after the first action")
                     .with_executed(1),
             ),
-            observation: Observation {
+            image_expired: false,
+            observation: Some(Observation {
                 frame_id: "f_test_partial".to_owned(),
                 target: "test:screen".to_owned(),
                 width: 100,
@@ -547,7 +612,7 @@ mod tests {
                 coordinate_space: cu_protocol::CoordinateSpace::FramePixels,
                 settled: true,
                 image_path: image_path.to_string_lossy().into_owned(),
-            },
+            }),
         };
 
         let result = to_tool_result(ResponseEnvelope {
@@ -566,5 +631,34 @@ mod tests {
         assert_eq!(structured["observation"]["frame_id"], "f_test_partial");
         assert_eq!(result.content.len(), 2);
         assert!(result.content[1].as_image().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_cached_action_is_a_non_error_without_an_image() {
+        let result = to_tool_result(ResponseEnvelope {
+            request_id: "expired-replay".to_owned(),
+            result: ResponseResult::Ok(DaemonResponse::Act(ActOutcome {
+                status: ActStatus::Ok,
+                executed: 1,
+                action_error: None,
+                image_expired: true,
+                observation: None,
+            })),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["executed"], 1);
+        assert_eq!(structured["image_expired"], true);
+        assert!(structured.get("observation").is_none());
+        assert!(
+            result
+                .content
+                .iter()
+                .all(|content| content.as_image().is_none())
+        );
     }
 }

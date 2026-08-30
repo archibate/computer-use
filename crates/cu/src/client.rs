@@ -42,9 +42,24 @@ fn connection_error(socket: &Path, error: &io::Error) -> anyhow::Error {
     } else {
         format!("failed to connect to {}: {error}", socket.display())
     };
+    let start_command = named_instance_from_socket(socket).map_or_else(
+        || "`cu daemon`".to_owned(),
+        |instance| format!("`cu daemon --instance {instance}`"),
+    );
     anyhow!(
-        "{summary}\nstart it separately, then retry: `cu daemon` (auto-detects the desktop); use `cu daemon --help` for an explicit backend override"
+        "{summary}\nstart it separately, then retry: {start_command} (auto-detects the desktop); use `cu daemon --help` for an explicit backend override"
     )
+}
+
+fn named_instance_from_socket(socket: &Path) -> Option<&str> {
+    if socket.file_name()? != "cu.sock" {
+        return None;
+    }
+    let instance_dir = socket.parent()?;
+    if instance_dir.parent()?.file_name()? != "instances" {
+        return None;
+    }
+    instance_dir.file_name()?.to_str()
 }
 
 #[cfg(test)]
@@ -62,5 +77,15 @@ mod tests {
         assert!(message.contains("start it separately, then retry"));
         assert!(message.contains("`cu daemon`"));
         assert!(message.contains("`cu daemon --help`"));
+    }
+
+    #[test]
+    fn missing_named_instance_recommends_the_matching_daemon() {
+        let error = connection_error(
+            Path::new("/run/user/1000/computer-use/instances/x11-99/cu.sock"),
+            &io::Error::from(io::ErrorKind::NotFound),
+        );
+
+        assert!(error.to_string().contains("`cu daemon --instance x11-99`"));
     }
 }

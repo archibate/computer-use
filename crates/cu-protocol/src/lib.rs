@@ -257,8 +257,17 @@ pub struct ActOutcome {
     /// Failure that stopped a partial batch; absent when status is `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_error: Option<CuError>,
-    /// Fresh post-action or post-failure frame to use for subsequent reasoning.
-    pub observation: Observation,
+    /// Whether a cached replay outlived its retained screenshot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image_expired: bool,
+    /// Fresh post-action or post-failure frame, absent only after its cached image expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observation>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

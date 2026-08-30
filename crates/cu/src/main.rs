@@ -6,16 +6,17 @@ mod mcp;
 use std::{
     env,
     ffi::OsStr,
-    fs,
+    fmt, fs,
     io::{self, Read},
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    str::FromStr,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use backend::{BackendChoice, BackendOptions};
 use clap::{Parser, Subcommand};
-use cu_core::{CaptureLimits, Engine};
+use cu_core::{CaptureLimits, Engine, MIN_RETAINED_FRAMES};
 use cu_protocol::{ActRequest, DaemonRequest, ObserveRequest, RequestEnvelope};
 use uuid::Uuid;
 
@@ -44,10 +45,55 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstanceName(String);
+
+impl Default for InstanceName {
+    fn default() -> Self {
+        Self("default".to_owned())
+    }
+}
+
+impl fmt::Display for InstanceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for InstanceName {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > 64
+            || matches!(value, "." | "..")
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(
+                "instance must be 1-64 ASCII letters, digits, dots, underscores, or hyphens"
+                    .to_owned(),
+            );
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonPaths {
+    socket: PathBuf,
+    frame_dir: PathBuf,
+    instance_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the single-owner desktop session daemon.
+    /// Run one independently named desktop session daemon.
     Daemon {
+        /// Named socket and frame-store namespace; defaults to `default`.
+        #[arg(long, value_name = "NAME")]
+        instance: Option<InstanceName>,
         /// Select a desktop backend from the session, or require one explicitly.
         #[arg(long, value_enum, default_value_t)]
         backend: BackendChoice,
@@ -68,26 +114,40 @@ enum Command {
         /// Downscale captures to at most this height; native height when omitted.
         #[arg(long)]
         max_height: Option<u32>,
-        #[arg(long, default_value_t = 32)]
+        /// Maximum retained frames for this instance; must preserve grounding and result frames.
+        #[arg(
+            long,
+            default_value_t = 32,
+            value_parser = parse_max_frames
+        )]
         max_frames: usize,
-        #[arg(long)]
+        /// Raw socket override; requires `--frame-dir` and conflicts with `--instance`.
+        #[arg(long, conflicts_with = "instance", requires = "frame_dir")]
         socket: Option<PathBuf>,
-        #[arg(long)]
+        /// Raw frame-store override; requires `--socket` and conflicts with `--instance`.
+        #[arg(long, conflicts_with = "instance", requires = "socket")]
         frame_dir: Option<PathBuf>,
     },
     /// Capture a settled frame and print its JSON metadata.
     Observe {
-        #[arg(long)]
+        /// Connect to this named instance; defaults to `default`.
+        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+        instance: Option<InstanceName>,
+        /// Connect to this raw socket instead of a named instance.
+        #[arg(long, conflicts_with = "instance")]
         socket: Option<PathBuf>,
     },
     /// Execute a frame-grounded JSON action batch read from stdin.
     #[command(after_long_help = ACT_LONG_HELP)]
     Act {
         /// Print the accepted action-input JSON Schema and exit.
-        #[arg(long, conflicts_with_all = ["socket", "request_id"])]
+        #[arg(long, conflicts_with_all = ["instance", "socket", "request_id"])]
         schema: bool,
+        /// Connect to this named instance; defaults to `default`.
+        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+        instance: Option<InstanceName>,
         /// Connect to this daemon socket instead of the owner-only default.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "instance")]
         socket: Option<PathBuf>,
         /// Stable retry key for session-scoped action idempotency.
         #[arg(long)]
@@ -95,7 +155,11 @@ enum Command {
     },
     /// Serve `computer_observe` and `computer_act` over MCP stdio.
     Mcp {
-        #[arg(long)]
+        /// Connect to this named instance; defaults to `default`.
+        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+        instance: Option<InstanceName>,
+        /// Connect to this raw socket instead of a named instance.
+        #[arg(long, conflicts_with = "instance")]
         socket: Option<PathBuf>,
     },
 }
@@ -104,6 +168,7 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Daemon {
+            instance,
             backend,
             display,
             output,
@@ -113,27 +178,11 @@ async fn main() -> Result<()> {
             socket,
             frame_dir,
         } => {
-            let runtime = if socket.is_none() || frame_dir.is_none() {
-                let runtime = default_runtime_dir();
-                secure_runtime_dir(&runtime)?;
-                Some(runtime)
-            } else {
-                None
-            };
-            let socket = match socket {
-                Some(socket) => socket,
-                None => runtime
-                    .as_ref()
-                    .expect("default runtime resolved")
-                    .join("cu.sock"),
-            };
-            let frame_dir = match frame_dir {
-                Some(frame_dir) => frame_dir,
-                None => runtime
-                    .as_ref()
-                    .expect("default runtime resolved")
-                    .join("frames"),
-            };
+            let paths = resolve_daemon_paths(instance, socket, frame_dir)?;
+            if let Some(instance_dir) = &paths.instance_dir {
+                secure_managed_instance_dir(instance_dir)?;
+            }
+            let bound = daemon::bind(paths.socket.clone()).await?;
             let capture_limits = CaptureLimits {
                 max_width,
                 max_height,
@@ -144,14 +193,17 @@ async fn main() -> Result<()> {
                 output,
                 capture_limits,
             })?;
-            let engine = Engine::new(started.desktop, frame_dir, max_frames)?;
+            let engine = Engine::new(started.desktop, paths.frame_dir, max_frames)?;
             eprintln!("computer-use daemon targeting {}", started.target);
-            eprintln!("computer-use daemon listening at {}", socket.display());
-            serve_until_shutdown(socket, engine).await
+            eprintln!(
+                "computer-use daemon listening at {}",
+                paths.socket.display()
+            );
+            serve_until_shutdown(bound, engine).await
         }
-        Command::Observe { socket } => {
+        Command::Observe { instance, socket } => {
             let response = client::request(
-                &resolve_socket(socket),
+                &resolve_client_socket(instance, socket)?,
                 &RequestEnvelope {
                     request_id: Uuid::new_v4().to_string(),
                     request: DaemonRequest::Observe(ObserveRequest::default()),
@@ -163,6 +215,7 @@ async fn main() -> Result<()> {
         }
         Command::Act {
             schema,
+            instance,
             socket,
             request_id,
         } => {
@@ -177,7 +230,7 @@ async fn main() -> Result<()> {
             let act = serde_json::from_str::<ActRequest>(&input)
                 .context("stdin is not valid action JSON; run `cu act --schema` for the format")?;
             let response = client::request(
-                &resolve_socket(socket),
+                &resolve_client_socket(instance, socket)?,
                 &RequestEnvelope {
                     request_id: request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
                     request: DaemonRequest::Act(act),
@@ -187,7 +240,9 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         }
-        Command::Mcp { socket } => mcp::serve(resolve_socket(socket)).await,
+        Command::Mcp { instance, socket } => {
+            mcp::serve(resolve_client_socket(instance, socket)?).await
+        }
     }
 }
 
@@ -196,11 +251,28 @@ fn render_act_schema() -> Result<String> {
         .context("failed to render action-input JSON Schema")
 }
 
-async fn serve_until_shutdown(socket: PathBuf, engine: Engine) -> Result<()> {
+fn parse_max_frames(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid frame count: {error}"))?;
+    if value < MIN_RETAINED_FRAMES {
+        return Err(format!("max-frames must be at least {MIN_RETAINED_FRAMES}"));
+    }
+    Ok(value)
+}
+
+async fn serve_until_shutdown(bound: daemon::BoundSocket, engine: Engine) -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to listen for SIGTERM")?;
     tokio::select! {
-        result = daemon::serve(socket, engine) => result,
+        result = daemon::serve(bound, engine) => result,
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to listen for Ctrl+C")?;
+            eprintln!("computer-use daemon shutting down");
+            Ok(())
+        }
+        signal = terminate.recv() => {
+            signal.context("SIGTERM listener closed unexpectedly")?;
             eprintln!("computer-use daemon shutting down");
             Ok(())
         }
@@ -222,11 +294,73 @@ fn default_runtime_dir_from(xdg_runtime_dir: Option<&OsStr>, effective_uid: u32)
     root.join("computer-use")
 }
 
-fn resolve_socket(socket: Option<PathBuf>) -> PathBuf {
-    socket.unwrap_or_else(|| default_runtime_dir().join("cu.sock"))
+fn resolve_daemon_paths(
+    instance: Option<InstanceName>,
+    socket: Option<PathBuf>,
+    frame_dir: Option<PathBuf>,
+) -> Result<DaemonPaths> {
+    match (instance, socket, frame_dir) {
+        (instance, None, None) => {
+            let instance_dir = named_instance_dir(&instance.unwrap_or_default());
+            Ok(DaemonPaths {
+                socket: instance_dir.join("cu.sock"),
+                frame_dir: instance_dir.join("frames"),
+                instance_dir: Some(instance_dir),
+            })
+        }
+        (None, Some(socket), Some(frame_dir)) => {
+            if socket.starts_with(&frame_dir) || frame_dir.starts_with(&socket) {
+                bail!("--socket and --frame-dir must identify separate resources");
+            }
+            Ok(DaemonPaths {
+                socket,
+                frame_dir,
+                instance_dir: None,
+            })
+        }
+        (Some(_), Some(_), Some(_)) => {
+            bail!("--instance cannot be combined with raw --socket and --frame-dir overrides")
+        }
+        (_, Some(_), None) => {
+            bail!("daemon --socket requires --frame-dir; use --instance for a managed namespace")
+        }
+        (_, None, Some(_)) => {
+            bail!("daemon --frame-dir requires --socket; use --instance for a managed namespace")
+        }
+    }
 }
 
-fn secure_runtime_dir(path: &PathBuf) -> Result<()> {
+fn resolve_client_socket(
+    instance: Option<InstanceName>,
+    socket: Option<PathBuf>,
+) -> Result<PathBuf> {
+    match (instance, socket) {
+        (Some(_), Some(_)) => bail!("--instance cannot be combined with --socket"),
+        (None, Some(socket)) => Ok(socket),
+        (instance, None) => Ok(named_instance_dir(&instance.unwrap_or_default()).join("cu.sock")),
+    }
+}
+
+fn named_instance_dir(instance: &InstanceName) -> PathBuf {
+    let runtime = default_runtime_dir();
+    if instance.0 == "default" {
+        runtime
+    } else {
+        runtime.join("instances").join(&instance.0)
+    }
+}
+
+fn secure_managed_instance_dir(path: &Path) -> Result<()> {
+    let runtime = default_runtime_dir();
+    secure_runtime_dir(&runtime)?;
+    if path != runtime {
+        secure_runtime_dir(&runtime.join("instances"))?;
+        secure_runtime_dir(path)?;
+    }
+    Ok(())
+}
+
+fn secure_runtime_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("failed to create runtime directory {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -277,6 +411,88 @@ mod tests {
             Cli::try_parse_from(["cu", "daemon", "--display", ":99", "--output", "HDMI-A-1",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn named_instances_have_distinct_runtime_resources() {
+        let first = resolve_daemon_paths(Some("x11-99".parse().unwrap()), None, None).unwrap();
+        let second = resolve_daemon_paths(Some("x11-100".parse().unwrap()), None, None).unwrap();
+
+        assert_ne!(first.socket, second.socket);
+        assert_ne!(first.frame_dir, second.frame_dir);
+        assert!(first.socket.ends_with("instances/x11-99/cu.sock"));
+        assert!(first.frame_dir.ends_with("instances/x11-99/frames"));
+    }
+
+    #[test]
+    fn default_instance_preserves_the_legacy_runtime_paths() {
+        let paths = resolve_daemon_paths(None, None, None).unwrap();
+        let runtime = default_runtime_dir();
+
+        assert_eq!(paths.socket, runtime.join("cu.sock"));
+        assert_eq!(paths.frame_dir, runtime.join("frames"));
+    }
+
+    #[test]
+    fn raw_daemon_paths_must_be_supplied_as_a_pair() {
+        assert!(resolve_daemon_paths(None, Some(PathBuf::from("/tmp/a.sock")), None).is_err());
+        assert!(resolve_daemon_paths(None, None, Some(PathBuf::from("/tmp/a-frames"))).is_err());
+        assert!(Cli::try_parse_from(["cu", "daemon", "--socket", "/tmp/a.sock"]).is_err());
+        assert!(
+            resolve_daemon_paths(
+                None,
+                Some(PathBuf::from("/tmp/store/cu.sock")),
+                Some(PathBuf::from("/tmp/store")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn instance_names_are_single_safe_path_segments() {
+        for valid in ["default", "x11-99", "wayland.HDMI-A-1", "a_b"] {
+            assert!(valid.parse::<InstanceName>().is_ok(), "rejected {valid}");
+        }
+        for invalid in ["", ".", "..", "../escape", "has/slash", "空"] {
+            assert!(
+                invalid.parse::<InstanceName>().is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_and_raw_socket_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "cu",
+                "observe",
+                "--instance",
+                "x11-99",
+                "--socket",
+                "/tmp/a.sock",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cu",
+                "daemon",
+                "--instance",
+                "x11-99",
+                "--socket",
+                "/tmp/a.sock",
+                "--frame-dir",
+                "/tmp/a-frames",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn daemon_requires_two_retained_frames() {
+        assert!(Cli::try_parse_from(["cu", "daemon", "--max-frames", "1"]).is_err());
+        assert!(Cli::try_parse_from(["cu", "daemon", "--max-frames", "2"]).is_ok());
     }
 
     #[test]
