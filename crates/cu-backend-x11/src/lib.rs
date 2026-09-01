@@ -9,24 +9,32 @@ use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage, imageops::FilterType};
 use x11rb::{
-    CURRENT_TIME, NO_SYMBOL, NONE,
+    COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NO_SYMBOL, NONE,
     connection::Connection,
     image::{Image as XImage, PixelLayout},
     protocol::{
         xinput::{self, DeviceUse},
         xkb::{self, ConnectionExt as _},
         xproto::{
-            BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, KEY_PRESS_EVENT,
-            KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, ModMask, Screen, Visualtype,
+            AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _,
+            CreateWindowAux, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, ModMask,
+            PropMode, Screen, Visualtype, WindowClass,
         },
         xtest::ConnectionExt as _,
     },
     rust_connection::RustConnection,
+    wrapper::{ConnectionExt as _, GrabServer},
 };
 use xkeysym::{Keysym, key};
 
 const KEY_DELAY: Duration = Duration::from_millis(12);
 const DRAG_DELAY: Duration = Duration::from_millis(8);
+const KEYMAP_OWNER_ATOM_NAME: &[u8] = b"_COMPUTER_USE_X11_KEYMAP_OWNER_V1";
+const KEYMAP_JOURNAL_ATOM_NAME: &[u8] = b"_COMPUTER_USE_X11_KEYMAP_JOURNAL_V1";
+const KEYMAP_JOURNAL_MAGIC: u32 = 0x4355_4b4d;
+const KEYMAP_JOURNAL_VERSION: u32 = 1;
+const KEYMAP_JOURNAL_HEADER_WORDS: usize = 4;
+const MAX_KEYMAP_JOURNAL_WORDS: u32 = 256;
 
 pub struct X11Backend {
     connection: RustConnection,
@@ -110,7 +118,7 @@ impl X11Backend {
             keyboard_device,
             &modifier_keycodes,
         )?;
-        let keymap = KeyboardMap::read(&connection, &modifier_keycodes)?;
+        let keymap = KeyboardMap::read(&connection, screen.root, &modifier_keycodes)?;
 
         Ok(Self {
             connection,
@@ -489,12 +497,206 @@ impl X11Backend {
 
 impl Drop for X11Backend {
     fn drop(&mut self) {
-        for &keycode in self.keymap.mapped.values() {
-            let _ = self
-                .connection
-                .change_keyboard_mapping(1, keycode, 2, &[NO_SYMBOL, NO_SYMBOL]);
+        let _ = self.keymap.restore(&self.connection);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeymapJournal {
+    keysyms_per_keycode: u8,
+    borrowed: Vec<u8>,
+}
+
+struct KeymapLease {
+    root: u32,
+    owner_atom: u32,
+    owner_window: u32,
+    journal_atom: u32,
+}
+
+impl KeymapLease {
+    fn acquire(connection: &RustConnection, root: u32) -> Result<Self, CuError> {
+        let owner_atom = connection
+            .intern_atom(false, KEYMAP_OWNER_ATOM_NAME)
+            .map_err(input_error)?
+            .reply()
+            .map_err(input_error)?
+            .atom;
+        let journal_atom = connection
+            .intern_atom(false, KEYMAP_JOURNAL_ATOM_NAME)
+            .map_err(input_error)?
+            .reply()
+            .map_err(input_error)?
+            .atom;
+        let owner_window = connection.generate_id().map_err(input_error)?;
+        connection
+            .create_window(
+                COPY_DEPTH_FROM_PARENT,
+                owner_window,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .map_err(input_error)?
+            .check()
+            .map_err(input_error)?;
+
+        {
+            let _server_grab = GrabServer::grab(connection).map_err(input_error)?;
+            let current_owner = connection
+                .get_selection_owner(owner_atom)
+                .map_err(input_error)?
+                .reply()
+                .map_err(input_error)?
+                .owner;
+            if current_owner != NONE {
+                return Err(CuError::new(
+                    ErrorCode::LeaseConflict,
+                    "another X11 backend owns the temporary keyboard map",
+                ));
+            }
+            connection
+                .set_selection_owner(owner_window, owner_atom, CURRENT_TIME)
+                .map_err(input_error)?
+                .check()
+                .map_err(input_error)?;
+            let claimed_owner = connection
+                .get_selection_owner(owner_atom)
+                .map_err(input_error)?
+                .reply()
+                .map_err(input_error)?
+                .owner;
+            if claimed_owner != owner_window {
+                return Err(CuError::new(
+                    ErrorCode::LeaseConflict,
+                    "failed to claim the X11 temporary keyboard map",
+                ));
+            }
         }
-        let _ = self.connection.flush();
+        connection.sync().map_err(input_error)?;
+
+        Ok(Self {
+            root,
+            owner_atom,
+            owner_window,
+            journal_atom,
+        })
+    }
+
+    fn recover(
+        &self,
+        connection: &RustConnection,
+        min_keycode: u8,
+        max_keycode: u8,
+        modifier_keycodes: &HashSet<u8>,
+    ) -> Result<(), CuError> {
+        let reply = connection
+            .get_property(
+                false,
+                self.root,
+                self.journal_atom,
+                AtomEnum::CARDINAL,
+                0,
+                MAX_KEYMAP_JOURNAL_WORDS,
+            )
+            .map_err(input_error)?
+            .reply()
+            .map_err(input_error)?;
+        if reply.type_ == NONE {
+            return Ok(());
+        }
+        if reply.type_ != u32::from(AtomEnum::CARDINAL) || reply.bytes_after != 0 {
+            return Err(invalid_keymap_journal(
+                "property type or length does not match the journal format",
+            ));
+        }
+        let words = reply
+            .value32()
+            .ok_or_else(|| invalid_keymap_journal("property is not 32-bit"))?
+            .collect::<Vec<_>>();
+        let journal = decode_keymap_journal(&words)?;
+        let empty_mapping = vec![NO_SYMBOL; usize::from(journal.keysyms_per_keycode)];
+        for &keycode in &journal.borrowed {
+            if !(min_keycode..=max_keycode).contains(&keycode)
+                || modifier_keycodes.contains(&keycode)
+            {
+                return Err(invalid_keymap_journal(
+                    "journal contains a keycode outside the safe temporary range",
+                ));
+            }
+            connection
+                .change_keyboard_mapping(1, keycode, journal.keysyms_per_keycode, &empty_mapping)
+                .map_err(input_error)?
+                .check()
+                .map_err(input_error)?;
+        }
+        connection
+            .delete_property(self.root, self.journal_atom)
+            .map_err(input_error)?
+            .check()
+            .map_err(input_error)?;
+        connection.sync().map_err(input_error)
+    }
+
+    fn persist(
+        &self,
+        connection: &RustConnection,
+        keysyms_per_keycode: u8,
+        borrowed: &[u8],
+    ) -> Result<(), CuError> {
+        let words = encode_keymap_journal(keysyms_per_keycode, borrowed)?;
+        connection
+            .change_property32(
+                PropMode::REPLACE,
+                self.root,
+                self.journal_atom,
+                AtomEnum::CARDINAL,
+                &words,
+            )
+            .map_err(input_error)?
+            .check()
+            .map_err(input_error)?;
+        connection.sync().map_err(input_error)
+    }
+
+    fn release(&self, connection: &RustConnection, journal: &KeymapJournal) -> Result<(), CuError> {
+        if !journal.borrowed.is_empty() {
+            let empty_mapping = vec![NO_SYMBOL; usize::from(journal.keysyms_per_keycode)];
+            for &keycode in &journal.borrowed {
+                connection
+                    .change_keyboard_mapping(
+                        1,
+                        keycode,
+                        journal.keysyms_per_keycode,
+                        &empty_mapping,
+                    )
+                    .map_err(input_error)?
+                    .check()
+                    .map_err(input_error)?;
+            }
+            connection
+                .delete_property(self.root, self.journal_atom)
+                .map_err(input_error)?
+                .check()
+                .map_err(input_error)?;
+        }
+        connection
+            .set_selection_owner(NONE, self.owner_atom, CURRENT_TIME)
+            .map_err(input_error)?
+            .check()
+            .map_err(input_error)?;
+        connection
+            .destroy_window(self.owner_window)
+            .map_err(input_error)?
+            .check()
+            .map_err(input_error)?;
+        connection.sync().map_err(input_error)
     }
 }
 
@@ -503,16 +705,24 @@ struct KeyboardMap {
     keysyms_per_keycode: u8,
     keysyms: Vec<u32>,
     unused: VecDeque<u8>,
+    borrowed: Vec<u8>,
     mapped: HashMap<u32, u8>,
     mapped_order: VecDeque<u32>,
     held: HashSet<u8>,
+    lease: KeymapLease,
 }
 
 impl KeyboardMap {
-    fn read(connection: &RustConnection, modifier_keycodes: &HashSet<u8>) -> Result<Self, CuError> {
+    fn read(
+        connection: &RustConnection,
+        root: u32,
+        modifier_keycodes: &HashSet<u8>,
+    ) -> Result<Self, CuError> {
         let setup = connection.setup();
         let min_keycode = setup.min_keycode;
         let max_keycode = setup.max_keycode;
+        let lease = KeymapLease::acquire(connection, root)?;
+        lease.recover(connection, min_keycode, max_keycode, modifier_keycodes)?;
         let count = max_keycode
             .checked_sub(min_keycode)
             .and_then(|difference| difference.checked_add(1))
@@ -548,9 +758,11 @@ impl KeyboardMap {
             keysyms_per_keycode: reply.keysyms_per_keycode,
             keysyms: reply.keysyms,
             unused,
+            borrowed: Vec::new(),
             mapped: HashMap::new(),
             mapped_order: VecDeque::new(),
             held: HashSet::new(),
+            lease,
         })
     }
 
@@ -564,6 +776,10 @@ impl KeyboardMap {
         }
 
         let keycode = if let Some(keycode) = self.unused.pop_front() {
+            if let Err(error) = self.borrow_keycode(connection, keycode) {
+                self.unused.push_front(keycode);
+                return Err(error);
+            }
             keycode
         } else {
             self.reusable_keycode()?
@@ -578,12 +794,25 @@ impl KeyboardMap {
         Ok(keycode)
     }
 
+    fn borrow_keycode(&mut self, connection: &RustConnection, keycode: u8) -> Result<(), CuError> {
+        self.borrowed.push(keycode);
+        if let Err(error) = self
+            .lease
+            .persist(connection, self.keysyms_per_keycode, &self.borrowed)
+        {
+            self.borrowed.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn base_keycode(&self, symbol: u32) -> Option<u8> {
-        self.keysyms
-            .chunks(usize::from(self.keysyms_per_keycode))
-            .position(|symbols| symbols.first() == Some(&symbol))
-            .and_then(|offset| u8::try_from(offset).ok())
-            .and_then(|offset| self.min_keycode.checked_add(offset))
+        base_keycode(
+            self.min_keycode,
+            self.keysyms_per_keycode,
+            &self.keysyms,
+            symbol,
+        )
     }
 
     fn reusable_keycode(&mut self) -> Result<u8, CuError> {
@@ -611,6 +840,102 @@ impl KeyboardMap {
         self.mapped_order.retain(|&existing| existing != symbol);
         self.mapped_order.push_back(symbol);
     }
+
+    fn restore(&mut self, connection: &RustConnection) -> Result<(), CuError> {
+        let journal = KeymapJournal {
+            keysyms_per_keycode: self.keysyms_per_keycode,
+            borrowed: self.borrowed.clone(),
+        };
+        self.lease.release(connection, &journal)?;
+        self.borrowed.clear();
+        self.mapped.clear();
+        self.mapped_order.clear();
+        self.held.clear();
+        Ok(())
+    }
+}
+
+fn encode_keymap_journal(keysyms_per_keycode: u8, borrowed: &[u8]) -> Result<Vec<u32>, CuError> {
+    if keysyms_per_keycode == 0 {
+        return Err(invalid_keymap_journal("keysyms-per-keycode is zero"));
+    }
+    let capacity = borrowed
+        .len()
+        .checked_add(KEYMAP_JOURNAL_HEADER_WORDS)
+        .ok_or_else(|| invalid_keymap_journal("journal length overflows"))?;
+    let mut words = Vec::with_capacity(capacity);
+    words.extend([
+        KEYMAP_JOURNAL_MAGIC,
+        KEYMAP_JOURNAL_VERSION,
+        u32::from(keysyms_per_keycode),
+        u32::try_from(borrowed.len())
+            .map_err(|_| invalid_keymap_journal("too many borrowed keycodes"))?,
+    ]);
+    words.extend(borrowed.iter().copied().map(u32::from));
+    Ok(words)
+}
+
+fn decode_keymap_journal(words: &[u32]) -> Result<KeymapJournal, CuError> {
+    let [
+        magic,
+        version,
+        keysyms_per_keycode,
+        borrowed_count,
+        payload @ ..,
+    ] = words
+    else {
+        return Err(invalid_keymap_journal("journal header is truncated"));
+    };
+    if *magic != KEYMAP_JOURNAL_MAGIC || *version != KEYMAP_JOURNAL_VERSION {
+        return Err(invalid_keymap_journal(
+            "journal magic or version is unsupported",
+        ));
+    }
+    let keysyms_per_keycode = u8::try_from(*keysyms_per_keycode)
+        .ok()
+        .filter(|&count| count != 0)
+        .ok_or_else(|| invalid_keymap_journal("invalid keysyms-per-keycode"))?;
+    let borrowed_count = usize::try_from(*borrowed_count)
+        .map_err(|_| invalid_keymap_journal("borrowed keycode count is too large"))?;
+    if payload.len() != borrowed_count {
+        return Err(invalid_keymap_journal("journal payload length is invalid"));
+    }
+    let mut seen = HashSet::new();
+    let mut borrowed = Vec::with_capacity(borrowed_count);
+    for &raw_keycode in payload {
+        let keycode = u8::try_from(raw_keycode)
+            .map_err(|_| invalid_keymap_journal("keycode is outside the X11 range"))?;
+        if keycode == 8 || !seen.insert(keycode) {
+            return Err(invalid_keymap_journal(
+                "journal contains a reserved or duplicate keycode",
+            ));
+        }
+        borrowed.push(keycode);
+    }
+    Ok(KeymapJournal {
+        keysyms_per_keycode,
+        borrowed,
+    })
+}
+
+fn invalid_keymap_journal(message: &str) -> CuError {
+    CuError::new(
+        ErrorCode::InputFailed,
+        format!("invalid cu X11 keymap recovery journal: {message}"),
+    )
+}
+
+fn base_keycode(
+    min_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysyms: &[u32],
+    symbol: u32,
+) -> Option<u8> {
+    keysyms
+        .chunks(usize::from(keysyms_per_keycode))
+        .position(|symbols| symbols.first() == Some(&symbol))
+        .and_then(|offset| u8::try_from(offset).ok())
+        .and_then(|offset| min_keycode.checked_add(offset))
 }
 
 fn read_modifier_keycodes(connection: &RustConnection) -> Result<HashSet<u8>, CuError> {
@@ -816,19 +1141,161 @@ mod tests {
 
     #[test]
     fn finds_base_keysyms_only_in_the_unmodified_column() {
-        let keymap = KeyboardMap {
-            min_keycode: 8,
-            keysyms_per_keycode: 2,
-            keysyms: vec![key::a, key::A, key::b, key::B],
-            unused: VecDeque::new(),
-            mapped: HashMap::new(),
-            mapped_order: VecDeque::new(),
-            held: HashSet::new(),
+        let keysyms = [key::a, key::A, key::b, key::B];
+
+        assert_eq!(base_keycode(8, 2, &keysyms, key::a), Some(8));
+        assert_eq!(base_keycode(8, 2, &keysyms, key::A), None);
+        assert_eq!(base_keycode(8, 2, &keysyms, key::b), Some(9));
+    }
+
+    #[test]
+    fn keymap_recovery_journal_round_trips_borrowed_keycodes() {
+        let journal = KeymapJournal {
+            keysyms_per_keycode: 4,
+            borrowed: vec![97, 103],
         };
 
-        assert_eq!(keymap.base_keycode(key::a), Some(8));
-        assert_eq!(keymap.base_keycode(key::A), None);
-        assert_eq!(keymap.base_keycode(key::b), Some(9));
+        let encoded =
+            encode_keymap_journal(journal.keysyms_per_keycode, &journal.borrowed).unwrap();
+
+        assert_eq!(decode_keymap_journal(&encoded).unwrap(), journal);
+    }
+
+    #[test]
+    fn keymap_recovery_journal_rejects_duplicate_keycodes() {
+        let words = [KEYMAP_JOURNAL_MAGIC, KEYMAP_JOURNAL_VERSION, 1, 2, 97, 97];
+
+        assert!(decode_keymap_journal(&words).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 server in CU_X11_TEST_DISPLAY"]
+    fn recovers_journaled_mapping_after_previous_x11_client_disconnects() {
+        let display = test_display();
+        let stale = install_stale_journaled_mapping(&display);
+        let backend = X11Backend::new(&display, CaptureLimits::default()).unwrap();
+        assert_mapping_was_recovered(&display, stale);
+        drop(backend);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 server in CU_X11_TEST_DISPLAY"]
+    fn backend_without_borrowed_keys_does_not_delete_a_later_journal() {
+        let display = test_display();
+        let backend = X11Backend::new(&display, CaptureLimits::default()).unwrap();
+        let stale = install_stale_journaled_mapping(&display);
+        drop(backend);
+
+        let replacement = X11Backend::new(&display, CaptureLimits::default()).unwrap();
+        assert_mapping_was_recovered(&display, stale);
+        drop(replacement);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 server in CU_X11_TEST_DISPLAY"]
+    fn keymap_lease_rejects_a_second_live_backend_and_releases_on_drop() {
+        let display = test_display();
+        let first = X11Backend::new(&display, CaptureLimits::default()).unwrap();
+
+        match X11Backend::new(&display, CaptureLimits::default()) {
+            Err(error) => assert_eq!(error.code, ErrorCode::LeaseConflict),
+            Ok(_) => panic!("a second backend unexpectedly acquired the keymap lease"),
+        }
+
+        drop(first);
+        let replacement = X11Backend::new(&display, CaptureLimits::default()).unwrap();
+        drop(replacement);
+    }
+
+    #[derive(Clone, Copy)]
+    struct StaleMapping {
+        keycode: u8,
+        root: u32,
+        journal_atom: u32,
+    }
+
+    fn test_display() -> String {
+        std::env::var("CU_X11_TEST_DISPLAY")
+            .expect("CU_X11_TEST_DISPLAY must name an isolated X11 server")
+    }
+
+    fn install_stale_journaled_mapping(display: &str) -> StaleMapping {
+        let (connection, screen_index) = x11rb::connect(Some(display)).unwrap();
+        let root = connection.setup().roots[screen_index].root;
+        let min_keycode = connection.setup().min_keycode;
+        let max_keycode = connection.setup().max_keycode;
+        let count = max_keycode - min_keycode + 1;
+        let modifier_keycodes = read_modifier_keycodes(&connection).unwrap();
+        let mapping = connection
+            .get_keyboard_mapping(min_keycode, count)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let keycode = mapping
+            .keysyms
+            .chunks(usize::from(mapping.keysyms_per_keycode))
+            .zip(min_keycode..=max_keycode)
+            .find(|(symbols, keycode)| {
+                *keycode != 8
+                    && !modifier_keycodes.contains(keycode)
+                    && symbols.iter().all(|&symbol| symbol == NO_SYMBOL)
+            })
+            .map(|(_, keycode)| keycode)
+            .expect("isolated X11 server must expose a spare keycode");
+        let journal_atom = connection
+            .intern_atom(false, KEYMAP_JOURNAL_ATOM_NAME)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let journal_words = encode_keymap_journal(mapping.keysyms_per_keycode, &[keycode]).unwrap();
+        connection
+            .change_property32(
+                PropMode::REPLACE,
+                root,
+                journal_atom,
+                AtomEnum::CARDINAL,
+                &journal_words,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let stale_symbol = Keysym::from_char('你').raw();
+        connection
+            .change_keyboard_mapping(1, keycode, 2, &[stale_symbol, stale_symbol])
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.sync().unwrap();
+
+        StaleMapping {
+            keycode,
+            root,
+            journal_atom,
+        }
+    }
+
+    fn assert_mapping_was_recovered(display: &str, stale: StaleMapping) {
+        let (connection, _) = x11rb::connect(Some(display)).unwrap();
+        let restored = connection
+            .get_keyboard_mapping(stale.keycode, 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert!(restored.keysyms.iter().all(|&symbol| symbol == NO_SYMBOL));
+        let property = connection
+            .get_property(
+                false,
+                stale.root,
+                stale.journal_atom,
+                AtomEnum::CARDINAL,
+                0,
+                MAX_KEYMAP_JOURNAL_WORDS,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(property.type_, NONE);
     }
 
     #[test]
