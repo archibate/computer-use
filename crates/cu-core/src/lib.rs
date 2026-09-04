@@ -237,6 +237,7 @@ pub trait Desktop: Send {
 pub struct Engine {
     desktop: Box<dyn Desktop>,
     frames: FrameStore,
+    profile: Option<String>,
     session_id: Uuid,
     revision: u64,
     latest: Option<Observation>,
@@ -266,6 +267,7 @@ impl Engine {
         Ok(Self {
             desktop,
             frames: FrameStore::new(frame_dir.into(), max_frames)?,
+            profile: None,
             session_id: Uuid::new_v4(),
             revision: 0,
             latest: None,
@@ -273,6 +275,13 @@ impl Engine {
             cache_order: VecDeque::new(),
             max_cached_actions: MAX_CACHED_ACTIONS,
         })
+    }
+
+    /// Attach trusted desktop-operating instructions to this daemon session.
+    #[must_use]
+    pub fn with_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
     }
 
     #[must_use]
@@ -305,6 +314,10 @@ impl Engine {
         }
 
         match &envelope.request {
+            DaemonRequest::Profile => response_from_result(
+                envelope.request_id.clone(),
+                Ok(DaemonResponse::Profile(self.profile.clone())),
+            ),
             DaemonRequest::Observe(request) => {
                 let result = validate_settle_policy(request.settle)
                     .and_then(|()| self.observe(request.settle))
@@ -910,6 +923,27 @@ mod tests {
             panic!("expected observation");
         };
         observation
+    }
+
+    #[test]
+    fn profile_is_returned_without_capturing_the_desktop() {
+        let directory = TempDir::new().unwrap();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine(&directory, Vec::new(), executed)
+            .with_profile(Some("# Desktop\n\nSuper+Left tiles left.".to_owned()));
+
+        let response = engine.handle(RequestEnvelope {
+            request_id: "profile-1".to_owned(),
+            request: DaemonRequest::Profile,
+        });
+
+        assert_eq!(
+            response.result,
+            ResponseResult::Ok(DaemonResponse::Profile(Some(
+                "# Desktop\n\nSuper+Left tiles left.".to_owned()
+            )))
+        );
+        assert!(engine.latest().is_none());
     }
 
     #[test]

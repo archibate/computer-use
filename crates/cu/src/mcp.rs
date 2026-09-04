@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cu_protocol::{
@@ -21,6 +24,7 @@ use uuid::Uuid;
 use crate::client;
 
 const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the frame is unknown. Use only the latest returned frame_id as computer_act.expected_frame_id; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation; ground the next action in that image. Batch actions only when no intermediate inspection is needed. After stale_frame, observe again. If a cached action replay says image_expired, the recorded action already executed: do not repeat it; observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct McpObservation {
@@ -111,15 +115,17 @@ impl From<ActOutcome> for McpActOutcome {
 #[derive(Clone)]
 pub struct ComputerUseMcp {
     socket: PathBuf,
+    instructions: String,
     session_id: Uuid,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl ComputerUseMcp {
-    pub fn new(socket: PathBuf) -> Self {
+    pub fn new(socket: PathBuf, profile: Option<&str>) -> Self {
         Self {
             socket,
+            instructions: compose_instructions(profile),
             session_id: Uuid::new_v4(),
             tool_router: Self::tool_router(),
         }
@@ -202,7 +208,7 @@ impl ServerHandler for ComputerUseMcp {
                     .with_title("cu computer use")
                     .with_description("Frame-grounded control of a local Linux desktop"),
             )
-            .with_instructions(MCP_INSTRUCTIONS)
+            .with_instructions(self.instructions.clone())
     }
 
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
@@ -211,12 +217,48 @@ impl ServerHandler for ComputerUseMcp {
 }
 
 pub async fn serve(socket: PathBuf) -> anyhow::Result<()> {
-    ComputerUseMcp::new(socket)
+    let profile = match tokio::time::timeout(PROFILE_FETCH_TIMEOUT, fetch_profile(&socket)).await {
+        Ok(Ok(profile)) => profile,
+        Ok(Err(error)) => {
+            eprintln!("desktop profile unavailable; using generic MCP instructions: {error:#}");
+            None
+        }
+        Err(_) => {
+            eprintln!("desktop profile fetch timed out; using generic MCP instructions");
+            None
+        }
+    };
+    ComputerUseMcp::new(socket, profile.as_deref())
         .serve(stdio())
         .await?
         .waiting()
         .await?;
     Ok(())
+}
+
+fn compose_instructions(profile: Option<&str>) -> String {
+    match profile {
+        Some(profile) => format!("{MCP_INSTRUCTIONS}\n\nDesktop profile:\n{profile}"),
+        None => MCP_INSTRUCTIONS.to_owned(),
+    }
+}
+
+async fn fetch_profile(socket: &Path) -> anyhow::Result<Option<String>> {
+    let response = client::request(
+        socket,
+        &RequestEnvelope {
+            request_id: format!("mcp-profile:{}", Uuid::new_v4()),
+            request: DaemonRequest::Profile,
+        },
+    )
+    .await?;
+    match response.result {
+        ResponseResult::Ok(DaemonResponse::Profile(profile)) => Ok(profile),
+        ResponseResult::Error(error) => Err(anyhow::anyhow!(error)),
+        ResponseResult::Ok(_) => {
+            anyhow::bail!("daemon returned the wrong response to profile request")
+        }
+    }
 }
 
 async fn to_tool_result(response: ResponseEnvelope) -> Result<CallToolResult, McpError> {
@@ -240,6 +282,12 @@ async fn to_tool_result(response: ResponseEnvelope) -> Result<CallToolResult, Mc
                     "message": "action result omitted its observation",
                 }))),
             }
+        }
+        ResponseResult::Ok(DaemonResponse::Profile(_)) => {
+            Ok(CallToolResult::structured_error(json!({
+                "code": "internal",
+                "message": "profile response reached a computer tool",
+            })))
         }
     }
 }
@@ -307,7 +355,7 @@ mod tests {
 
     #[test]
     fn exposes_only_the_agent_loop_tools() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"));
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let mut names = server
             .tool_router
             .list_all()
@@ -321,7 +369,7 @@ mod tests {
 
     #[test]
     fn identifies_itself_and_explains_the_complete_agent_loop() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"));
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let info = server.get_info();
 
         assert_eq!(info.server_info.name, "cu");
@@ -343,8 +391,21 @@ mod tests {
     }
 
     #[test]
+    fn appends_the_daemon_profile_to_initialization_instructions() {
+        let server = ComputerUseMcp::new(
+            PathBuf::from("/tmp/not-used.sock"),
+            Some("# Desktop\n\nSuper+Left tiles the focused window left."),
+        );
+        let instructions = server.get_info().instructions.unwrap();
+
+        assert!(instructions.starts_with(MCP_INSTRUCTIONS));
+        assert!(instructions.contains("Desktop profile:\n# Desktop"));
+        assert!(instructions.contains("Super+Left tiles the focused window left."));
+    }
+
+    #[test]
     fn publishes_described_bounded_input_and_structured_output_schemas() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"));
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let observe = tool(&server, "computer_observe");
         let act = tool(&server, "computer_act");
 
@@ -443,7 +504,7 @@ mod tests {
 
     #[test]
     fn normal_action_result_contains_every_schema_required_field() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"));
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let act_output = tool(&server, "computer_act").output_schema.unwrap();
         let normal = serde_json::to_value(McpActOutcome {
             status: ActStatus::Ok,
@@ -470,7 +531,7 @@ mod tests {
     #[tokio::test]
     async fn missing_daemon_returns_a_start_command_to_the_agent() {
         let directory = TempDir::new().unwrap();
-        let server = ComputerUseMcp::new(directory.path().join("missing.sock"));
+        let server = ComputerUseMcp::new(directory.path().join("missing.sock"), None);
 
         let result = server
             .call(

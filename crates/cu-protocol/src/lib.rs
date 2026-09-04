@@ -179,6 +179,7 @@ pub struct ActRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    Profile,
     Observe(ObserveRequest),
     Act(ActRequest),
 }
@@ -273,6 +274,7 @@ const fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "result", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    Profile(Option<String>),
     Observe(Observation),
     Act(ActOutcome),
 }
@@ -556,6 +558,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(action).unwrap(),
             serde_json::json!({"type": "keypress", "keys": ["CTRL", "L"]})
+        );
+    }
+
+    #[test]
+    fn serializes_profile_exchange_with_stable_discriminators() {
+        assert_eq!(
+            serde_json::to_value(DaemonRequest::Profile).unwrap(),
+            serde_json::json!({"operation": "profile"})
+        );
+        assert_eq!(
+            serde_json::to_value(DaemonResponse::Profile(Some("desktop guide".to_owned())))
+                .unwrap(),
+            serde_json::json!({"operation": "profile", "result": "desktop guide"})
         );
     }
 

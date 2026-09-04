@@ -20,6 +20,8 @@ use cu_core::{CaptureLimits, Engine, MIN_RETAINED_FRAMES};
 use cu_protocol::{ActRequest, DaemonRequest, ObserveRequest, RequestEnvelope};
 use uuid::Uuid;
 
+const MAX_PROFILE_BYTES: usize = 16 * 1024;
+
 const ACT_LONG_HELP: &str = "\
 INPUT JSON
   expected_frame_id  Latest frame_id returned by `cu observe` or a prior action.
@@ -121,6 +123,9 @@ enum Command {
             value_parser = parse_max_frames
         )]
         max_frames: usize,
+        /// Trusted UTF-8 Markdown or text appended to MCP initialization instructions.
+        #[arg(long, value_name = "PATH")]
+        profile: Option<PathBuf>,
         /// Raw socket override; requires `--frame-dir` and conflicts with `--instance`.
         #[arg(long, conflicts_with = "instance", requires = "frame_dir")]
         socket: Option<PathBuf>,
@@ -175,9 +180,11 @@ async fn main() -> Result<()> {
             max_width,
             max_height,
             max_frames,
+            profile,
             socket,
             frame_dir,
         } => {
+            let profile = profile.as_deref().map(read_profile).transpose()?;
             let paths = resolve_daemon_paths(instance, socket, frame_dir)?;
             if let Some(instance_dir) = &paths.instance_dir {
                 secure_managed_instance_dir(instance_dir)?;
@@ -193,7 +200,8 @@ async fn main() -> Result<()> {
                 output,
                 capture_limits,
             })?;
-            let engine = Engine::new(started.desktop, paths.frame_dir, max_frames)?;
+            let engine =
+                Engine::new(started.desktop, paths.frame_dir, max_frames)?.with_profile(profile);
             eprintln!("computer-use daemon targeting {}", started.target);
             eprintln!(
                 "computer-use daemon listening at {}",
@@ -249,6 +257,25 @@ async fn main() -> Result<()> {
 fn render_act_schema() -> Result<String> {
     serde_json::to_string_pretty(&schemars::schema_for!(ActRequest))
         .context("failed to render action-input JSON Schema")
+}
+
+fn read_profile(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open desktop profile {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read desktop profile {}", path.display()))?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        bail!("desktop profile must be at most {MAX_PROFILE_BYTES} bytes");
+    }
+    let profile = String::from_utf8(bytes)
+        .with_context(|| format!("desktop profile {} is not UTF-8", path.display()))?;
+    let profile = profile.trim();
+    if profile.is_empty() {
+        bail!("desktop profile must not be empty");
+    }
+    Ok(profile.to_owned())
 }
 
 fn parse_max_frames(value: &str) -> std::result::Result<usize, String> {
@@ -403,6 +430,39 @@ mod tests {
         };
 
         assert_eq!(display.as_deref(), Some(":99"));
+    }
+
+    #[test]
+    fn daemon_accepts_a_desktop_profile_path() {
+        let cli = Cli::try_parse_from(["cu", "daemon", "--profile", "/tmp/desktop.md"]).unwrap();
+        let Command::Daemon { profile, .. } = cli.command else {
+            panic!("expected daemon command");
+        };
+
+        assert_eq!(profile, Some(PathBuf::from("/tmp/desktop.md")));
+    }
+
+    #[test]
+    fn profile_reader_accepts_bounded_utf8_and_rejects_invalid_input() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let valid = directory.path().join("profile.md");
+        fs::write(&valid, "  # Desktop\n\nSuper+Left tiles left.\n").unwrap();
+        assert_eq!(
+            read_profile(&valid).unwrap(),
+            "# Desktop\n\nSuper+Left tiles left."
+        );
+
+        let empty = directory.path().join("empty.txt");
+        fs::write(&empty, " \n").unwrap();
+        assert!(read_profile(&empty).is_err());
+
+        let oversized = directory.path().join("oversized.txt");
+        fs::write(&oversized, vec![b'x'; MAX_PROFILE_BYTES + 1]).unwrap();
+        assert!(read_profile(&oversized).is_err());
+
+        let invalid = directory.path().join("invalid.txt");
+        fs::write(&invalid, [0xff]).unwrap();
+        assert!(read_profile(&invalid).is_err());
     }
 
     #[test]

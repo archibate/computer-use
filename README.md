@@ -30,6 +30,7 @@ cu daemon
 # Explicit backend overrides
 cu daemon --backend wayland
 cu daemon --backend x11 --display :0
+cu daemon --backend x11 --display :99 --profile ~/.config/codex-agent-desktop/profile.md
 
 # Independent daemons for two X11 displays
 cu daemon --instance x11-99 --backend x11 --display :99
@@ -41,6 +42,14 @@ Wayland session selects the direct Wayland backend even when XWayland also sets
 `DISPLAY`; an X11 session selects the X11 backend. `--display` selects X11 in
 automatic mode, while `--output` selects direct Wayland. `--max-width` and
 `--max-height` add optional downscaling limits for either backend.
+
+`--profile` loads a trusted UTF-8 Markdown or text file of at most 16 KiB. The
+daemon serves that text to MCP adapters, which append it once to their
+initialization instructions. This keeps desktop-specific operating guidance,
+such as verified window-manager shortcuts, out of the generic tool schemas and
+per-frame responses. After changing the file, restart the daemon and then the
+MCP connection so both reload it. If the daemon or profile is unavailable when
+MCP starts, that connection keeps the generic instructions until it reconnects.
 
 | Desktop session | Backend | Status |
 | --- | --- | --- |
