@@ -145,12 +145,19 @@ claude mcp add --scope user --transport stdio cu -- cu mcp
 
 It exposes two tools:
 
-- `computer_observe` returns structured frame metadata and a PNG image.
-- `computer_act` requires the latest `frame_id`, executes a validated batch,
-  and returns structured execution metadata plus the resulting PNG.
+- `computer_observe` returns a session-local integer `frame`, dimensions,
+  settling status, and a PNG image.
+- `computer_act` requires that latest `frame`, executes a validated batch, and
+  returns execution metadata plus the next numbered observation and PNG.
 
 The published schemas describe every action, coordinate and key convention,
 settling limits, partial execution, and stale-frame recovery.
+
+MCP frame numbers start at 1, increase for each distinct result, and are valid
+only within that MCP process. The adapter maps them to the daemon's opaque frame
+IDs, which remain part of the CLI and daemon protocols but are not exposed to
+the agent. Call `computer_observe` again after `stale_frame`, cancellation, or a
+timed-out call.
 
 The engine rejects stale frames before input, validates the complete batch
 before its first side effect, executes actions in order, and captures state

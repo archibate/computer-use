@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "cu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "cu-backend-wayland"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cu-core",
  "cu-protocol",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "cu-backend-x11"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cu-core",
  "cu-protocol",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "cu-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cu-protocol",
  "rustix",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "cu-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "schemars",
  "serde",
