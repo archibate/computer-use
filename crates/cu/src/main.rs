@@ -17,7 +17,10 @@ use anyhow::{Context, Result, bail};
 use backend::{BackendChoice, BackendOptions};
 use clap::{Parser, Subcommand};
 use cu_core::{CaptureLimits, Engine, MIN_RETAINED_FRAMES};
-use cu_protocol::{ActRequest, DaemonRequest, ObserveRequest, RequestEnvelope};
+use cu_protocol::{
+    ActRequest, DaemonRequest, MAX_WAIT_POLL_MS, MAX_WAIT_TIMEOUT_MS, MIN_WAIT_POLL_MS,
+    ObserveRequest, Rect, RequestEnvelope, SettlePolicy, WaitRequest,
+};
 use uuid::Uuid;
 
 const MAX_PROFILE_BYTES: usize = 16 * 1024;
@@ -142,6 +145,45 @@ enum Command {
         #[arg(long, conflicts_with = "instance")]
         socket: Option<PathBuf>,
     },
+    /// Print the latest published frame metadata without capturing.
+    Status {
+        /// Connect to this named instance; defaults to `default`.
+        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+        instance: Option<InstanceName>,
+        /// Connect to this raw socket instead of a named instance.
+        #[arg(long, conflicts_with = "instance")]
+        socket: Option<PathBuf>,
+    },
+    /// Wait for exact pixel changes relative to a published frame.
+    Wait {
+        /// Latest opaque frame id, normally read from `cu status`.
+        #[arg(long)]
+        last_frame_id: String,
+        /// Watched rectangle as x,y,width,height; defaults to the whole frame.
+        #[arg(long, value_parser = parse_rect, value_name = "X,Y,W,H")]
+        rect: Option<Rect>,
+        /// Ignored rectangle as x,y,width,height; may be repeated.
+        #[arg(long, value_parser = parse_rect, value_name = "X,Y,W,H")]
+        exclude: Vec<Rect>,
+        /// Maximum time to detect a change before returning changed=false.
+        #[arg(long, default_value_t = 30_000, value_parser = parse_wait_timeout)]
+        timeout_ms: u64,
+        /// Delay after each unchanged capture.
+        #[arg(long, default_value_t = 500, value_parser = parse_wait_poll)]
+        poll_ms: u64,
+        /// Required unchanged interval after a detected change.
+        #[arg(long, default_value_t = 150)]
+        quiet_ms: u64,
+        /// Maximum post-change settling grace.
+        #[arg(long, default_value_t = 1_500)]
+        settle_timeout_ms: u64,
+        /// Connect to this named instance; defaults to `default`.
+        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
+        instance: Option<InstanceName>,
+        /// Connect to this raw socket instead of a named instance.
+        #[arg(long, conflicts_with = "instance")]
+        socket: Option<PathBuf>,
+    },
     /// Execute a frame-grounded JSON action batch read from stdin.
     #[command(after_long_help = ACT_LONG_HELP)]
     Act {
@@ -186,40 +228,60 @@ async fn main() -> Result<()> {
         } => {
             let profile = profile.as_deref().map(read_profile).transpose()?;
             let paths = resolve_daemon_paths(instance, socket, frame_dir)?;
-            if let Some(instance_dir) = &paths.instance_dir {
-                secure_managed_instance_dir(instance_dir)?;
-            }
-            let bound = daemon::bind(paths.socket.clone()).await?;
-            let capture_limits = CaptureLimits {
-                max_width,
-                max_height,
-            };
-            let started = backend::start(&BackendOptions {
-                choice: backend,
-                display,
-                output,
-                capture_limits,
-            })?;
-            let engine =
-                Engine::new(started.desktop, paths.frame_dir, max_frames)?.with_profile(profile);
-            eprintln!("computer-use daemon targeting {}", started.target);
-            eprintln!(
-                "computer-use daemon listening at {}",
-                paths.socket.display()
-            );
-            serve_until_shutdown(bound, engine).await
+            start_daemon(
+                paths,
+                BackendOptions {
+                    choice: backend,
+                    display,
+                    output,
+                    capture_limits: CaptureLimits {
+                        max_width,
+                        max_height,
+                    },
+                },
+                max_frames,
+                profile,
+            )
+            .await
         }
         Command::Observe { instance, socket } => {
-            let response = client::request(
-                &resolve_client_socket(instance, socket)?,
-                &RequestEnvelope {
-                    request_id: Uuid::new_v4().to_string(),
-                    request: DaemonRequest::Observe(ObserveRequest::default()),
-                },
+            print_fresh_response(
+                instance,
+                socket,
+                DaemonRequest::Observe(ObserveRequest::default()),
             )
-            .await?;
-            println!("{}", serde_json::to_string(&response)?);
-            Ok(())
+            .await
+        }
+        Command::Status { instance, socket } => {
+            print_fresh_response(instance, socket, DaemonRequest::Status).await
+        }
+        Command::Wait {
+            last_frame_id,
+            rect,
+            exclude,
+            timeout_ms,
+            poll_ms,
+            quiet_ms,
+            settle_timeout_ms,
+            instance,
+            socket,
+        } => {
+            print_fresh_response(
+                instance,
+                socket,
+                DaemonRequest::Wait(WaitRequest {
+                    last_frame_id,
+                    rect,
+                    exclude,
+                    timeout_ms,
+                    poll_ms,
+                    settle: SettlePolicy {
+                        quiet_ms,
+                        timeout_ms: settle_timeout_ms,
+                    },
+                }),
+            )
+            .await
         }
         Command::Act {
             schema,
@@ -231,27 +293,74 @@ async fn main() -> Result<()> {
                 println!("{}", render_act_schema()?);
                 return Ok(());
             }
-            let mut input = String::new();
-            io::stdin()
-                .read_to_string(&mut input)
-                .context("failed to read action JSON from stdin")?;
-            let act = serde_json::from_str::<ActRequest>(&input)
-                .context("stdin is not valid action JSON; run `cu act --schema` for the format")?;
-            let response = client::request(
-                &resolve_client_socket(instance, socket)?,
-                &RequestEnvelope {
-                    request_id: request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-                    request: DaemonRequest::Act(act),
-                },
+            let act = read_act_request()?;
+            print_response(
+                instance,
+                socket,
+                request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                DaemonRequest::Act(act),
             )
-            .await?;
-            println!("{}", serde_json::to_string(&response)?);
-            Ok(())
+            .await
         }
         Command::Mcp { instance, socket } => {
             mcp::serve(resolve_client_socket(instance, socket)?).await
         }
     }
+}
+
+fn read_act_request() -> Result<ActRequest> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("failed to read action JSON from stdin")?;
+    serde_json::from_str(&input)
+        .context("stdin is not valid action JSON; run `cu act --schema` for the format")
+}
+
+async fn start_daemon(
+    paths: DaemonPaths,
+    options: BackendOptions,
+    max_frames: usize,
+    profile: Option<String>,
+) -> Result<()> {
+    if let Some(instance_dir) = &paths.instance_dir {
+        secure_managed_instance_dir(instance_dir)?;
+    }
+    let bound = daemon::bind(paths.socket.clone()).await?;
+    let started = backend::start(&options)?;
+    let engine = Engine::new(started.desktop, paths.frame_dir, max_frames)?.with_profile(profile);
+    eprintln!("computer-use daemon targeting {}", started.target);
+    eprintln!(
+        "computer-use daemon listening at {}",
+        paths.socket.display()
+    );
+    serve_until_shutdown(bound, engine).await
+}
+
+async fn print_response(
+    instance: Option<InstanceName>,
+    socket: Option<PathBuf>,
+    request_id: String,
+    request: DaemonRequest,
+) -> Result<()> {
+    let response = client::request(
+        &resolve_client_socket(instance, socket)?,
+        &RequestEnvelope {
+            request_id,
+            request,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+async fn print_fresh_response(
+    instance: Option<InstanceName>,
+    socket: Option<PathBuf>,
+    request: DaemonRequest,
+) -> Result<()> {
+    print_response(instance, socket, Uuid::new_v4().to_string(), request).await
 }
 
 fn render_act_schema() -> Result<String> {
@@ -286,6 +395,50 @@ fn parse_max_frames(value: &str) -> std::result::Result<usize, String> {
         return Err(format!("max-frames must be at least {MIN_RETAINED_FRAMES}"));
     }
     Ok(value)
+}
+
+fn parse_rect(value: &str) -> std::result::Result<Rect, String> {
+    let parts = value.split(',').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err("rectangle must be x,y,width,height".to_owned());
+    }
+    let parse = |part: &str, name: &str| {
+        part.parse::<u32>()
+            .map_err(|error| format!("invalid rectangle {name}: {error}"))
+    };
+    let rect = Rect {
+        x: parse(parts[0], "x")?,
+        y: parse(parts[1], "y")?,
+        width: parse(parts[2], "width")?,
+        height: parse(parts[3], "height")?,
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return Err("rectangle width and height must be positive".to_owned());
+    }
+    Ok(rect)
+}
+
+fn parse_wait_timeout(value: &str) -> std::result::Result<u64, String> {
+    parse_bounded_millis(value, 1, MAX_WAIT_TIMEOUT_MS, "timeout-ms")
+}
+
+fn parse_wait_poll(value: &str) -> std::result::Result<u64, String> {
+    parse_bounded_millis(value, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, "poll-ms")
+}
+
+fn parse_bounded_millis(
+    value: &str,
+    minimum: u64,
+    maximum: u64,
+    name: &str,
+) -> std::result::Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name}: {error}"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(format!("{name} must be between {minimum} and {maximum}"));
+    }
+    Ok(parsed)
 }
 
 async fn serve_until_shutdown(bound: daemon::BoundSocket, engine: Engine) -> Result<()> {
@@ -553,6 +706,89 @@ mod tests {
     fn daemon_requires_two_retained_frames() {
         assert!(Cli::try_parse_from(["cu", "daemon", "--max-frames", "1"]).is_err());
         assert!(Cli::try_parse_from(["cu", "daemon", "--max-frames", "2"]).is_ok());
+    }
+
+    #[test]
+    fn wait_requires_a_baseline_and_parses_repeated_rectangles() {
+        assert!(Cli::try_parse_from(["cu", "wait"]).is_err());
+        let cli = Cli::try_parse_from([
+            "cu",
+            "wait",
+            "--last-frame-id",
+            "f_latest",
+            "--rect",
+            "10,20,300,400",
+            "--exclude",
+            "20,30,4,5",
+            "--exclude",
+            "40,50,6,7",
+            "--timeout-ms",
+            "1000",
+            "--poll-ms",
+            "250",
+        ])
+        .unwrap();
+        let Command::Wait {
+            last_frame_id,
+            rect,
+            exclude,
+            timeout_ms,
+            poll_ms,
+            ..
+        } = cli.command
+        else {
+            panic!("expected wait command");
+        };
+        assert_eq!(last_frame_id, "f_latest");
+        assert_eq!(
+            rect,
+            Some(Rect {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 400
+            })
+        );
+        assert_eq!(exclude.len(), 2);
+        assert_eq!(timeout_ms, 1_000);
+        assert_eq!(poll_ms, 250);
+    }
+
+    #[test]
+    fn wait_rejects_bad_rectangles_and_timing_bounds() {
+        assert!(
+            Cli::try_parse_from([
+                "cu",
+                "wait",
+                "--last-frame-id",
+                "f_latest",
+                "--rect",
+                "1,2,0,4"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cu",
+                "wait",
+                "--last-frame-id",
+                "f_latest",
+                "--poll-ms",
+                "99"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cu",
+                "wait",
+                "--last-frame-id",
+                "f_latest",
+                "--timeout-ms",
+                "30001"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

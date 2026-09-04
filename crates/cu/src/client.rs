@@ -17,10 +17,6 @@ pub async fn request(socket: &Path, request: &RequestEnvelope) -> Result<Respons
         .write_all(&encoded)
         .await
         .context("failed to send request")?;
-    stream
-        .shutdown()
-        .await
-        .context("failed to finish request")?;
 
     let mut line = String::new();
     BufReader::new(stream)

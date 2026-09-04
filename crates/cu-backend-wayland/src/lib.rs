@@ -1,9 +1,9 @@
-use std::{io::Cursor, thread, time::Duration};
+use std::{sync::Arc, thread, time::Duration};
 
 use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use libwayshot::{OutputInfo, WayshotConnection};
 
 pub struct WaylandBackend {
@@ -76,11 +76,8 @@ impl WaylandBackend {
             })
     }
 
-    fn encode_frame(
-        &mut self,
-        image: DynamicImage,
-        output: &OutputInfo,
-    ) -> Result<CapturedFrame, CuError> {
+    fn prepare_frame(&mut self, image: DynamicImage, output: &OutputInfo) -> CapturedFrame {
+        let original = image.dimensions();
         let image = fit_within(image, self.capture_limits);
         let (width, height) = image.dimensions();
         let logical_size = output.logical_size();
@@ -97,21 +94,13 @@ impl WaylandBackend {
             },
         });
 
-        let mut png = Cursor::new(Vec::new());
-        image
-            .write_to(&mut png, ImageFormat::Png)
-            .map_err(|error| {
-                CuError::new(
-                    ErrorCode::CaptureFailed,
-                    format!("failed to encode screenshot as PNG: {error}"),
-                )
-            })?;
-        Ok(CapturedFrame {
-            png: png.into_inner(),
+        CapturedFrame {
+            pixels: Arc::from(image.to_rgb8().into_raw()),
             width,
             height,
             target: format!("output:{}", self.output_name),
-        })
+            resampled: original != (width, height),
+        }
     }
 
     fn map_point(&self, point: Point, viewport: Viewport) -> Result<Point, CuError> {
@@ -232,7 +221,7 @@ impl Desktop for WaylandBackend {
                     format!("failed to capture {}: {error}", self.output_name),
                 )
             })?;
-        self.encode_frame(image, &output)
+        Ok(self.prepare_frame(image, &output))
     }
 
     fn validate(&self, action: &Action) -> Result<(), CuError> {

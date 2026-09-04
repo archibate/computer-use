@@ -125,6 +125,47 @@ Coordinates are pixels in the returned, possibly downscaled frame. Supported
 actions are `move`, `click`, `double_click`, `drag`, `scroll`, `type`, and
 `keypress`. A batch contains at most 16 actions.
 
+To wait without keeping an agent turn active, read the current published
+baseline without taking another screenshot, then start a bounded wait:
+
+```sh
+frame_id=$(cu status | jq -er '.result.ok.result.frame_id')
+cu wait --last-frame-id "$frame_id" \
+  --rect 780,120,800,720 \
+  --exclude 1490,120,80,30 \
+  --timeout-ms 30000
+```
+
+If the daemon has not published a frame since startup, `cu status` returns
+`null`; run one observe first. After upgrading a running daemon, restart it
+before using the new status or wait protocol variants.
+
+`--rect` selects `x,y,width,height`; omitting it watches the whole frame.
+Repeat `--exclude` for carets, animated emoji, clocks, or other known noisy
+areas. Comparison is exact RGB over the watched pixels minus exclusions. When
+captures are downscaled, each exclusion is padded outward by three frame
+pixels to absorb resampling bleed.
+
+An unchanged timeout returns `changed:false` without publishing or evicting a
+frame, so an outer watcher may call `cu wait` again with the same baseline. A
+change returns a fresh observation plus `changed_pixels`, `changed_bbox`, and
+`resolution_changed`; `settled` describes the watched, non-excluded pixels.
+Any concurrent observe, act, or changed wait supersedes the baseline and makes
+other waits return `stale_frame`. At most four waits run concurrently; excess
+requests return `busy`. Detection polls every 500 ms by default (minimum 100
+ms), and the worst-case return time includes the detection timeout,
+post-change settle timeout, and one capture.
+
+This CLI operation is intended for an outer session watcher such as
+`monitor-wakeup`: loop across unchanged bounded timeouts, queue one static wake
+signal only after `changed:true`, then exit. Cancellation should simply drop the
+CLI process; the daemon notices the disconnect and stops polling. After wake-up,
+observe again before acting. `cu wait` is deliberately not an MCP tool because
+a long MCP call would keep the agent turn active. When several watchers feed one
+Codex thread, the changed watcher queues the single wake-up and stale sibling
+watchers exit quietly; the resumed turn observes all monitored regions before
+re-arming them.
+
 ## MCP
 
 Start `cu daemon` separately, then register the local stdio MCP server with one

@@ -5,15 +5,21 @@ use std::{
     io::{Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use cu_protocol::{
     ActOutcome, ActStatus, CoordinateSpace, CuError, DaemonRequest, DaemonResponse, ErrorCode,
-    Observation, RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy, Viewport,
-    validate_act_request, validate_settle_policy,
+    FrameStatus, Observation, Rect, RequestEnvelope, ResponseEnvelope, ResponseResult,
+    SettlePolicy, Viewport, WaitOutcome, WaitRequest, validate_act_request, validate_settle_policy,
+    validate_wait_request,
 };
+use image::{ImageFormat, RgbImage};
 use uuid::Uuid;
 
 pub const MIN_RETAINED_FRAMES: usize = 2;
@@ -155,11 +161,15 @@ fn resource_lock_path(resource: &Path) -> Result<PathBuf, CuError> {
     Ok(canonical_parent.join(lock_name))
 }
 
+#[derive(Debug, Clone)]
 pub struct CapturedFrame {
-    pub png: Vec<u8>,
+    /// Dense row-major RGB8 pixels.
+    pub pixels: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
     pub target: String,
+    /// Whether this frame was resampled from a different native size.
+    pub resampled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -240,10 +250,53 @@ pub struct Engine {
     profile: Option<String>,
     session_id: Uuid,
     revision: u64,
-    latest: Option<Observation>,
+    latest: Option<PublishedFrame>,
     completed_actions: HashMap<String, CachedAction>,
     cache_order: VecDeque<String>,
     max_cached_actions: usize,
+}
+
+struct PublishedFrame {
+    observation: Observation,
+    frame: CapturedFrame,
+}
+
+/// State for one bounded wait. The daemon owns sleeping and calls back one
+/// capture at a time so other clients can use the engine between polls.
+pub struct WaitTracker {
+    baseline_id: String,
+    baseline: CapturedFrame,
+    watched: Rect,
+    excluded: Vec<Rect>,
+    detection_deadline: Instant,
+    poll_interval: Duration,
+    settle: SettlePolicy,
+    phase: WaitPhase,
+}
+
+enum WaitPhase {
+    Watching,
+    Settling {
+        previous: CapturedFrame,
+        unchanged_since: Instant,
+        deadline: Instant,
+    },
+}
+
+/// Result of evaluating one captured wait sample.
+pub enum WaitStep {
+    Pending,
+    TimedOut(WaitOutcome),
+    Publish(WaitPublication),
+}
+
+/// A changed sample ready for the engine's final freshness and cancellation checks.
+pub struct WaitPublication {
+    pub frame: CapturedFrame,
+    pub settled: bool,
+    pub changed_pixels: Option<u64>,
+    pub changed_bbox: Option<Rect>,
+    pub resolution_changed: bool,
 }
 
 #[derive(Clone)]
@@ -286,7 +339,16 @@ impl Engine {
 
     #[must_use]
     pub fn latest(&self) -> Option<&Observation> {
-        self.latest.as_ref()
+        self.latest.as_ref().map(|latest| &latest.observation)
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Option<FrameStatus> {
+        self.latest().map(|observation| FrameStatus {
+            frame_id: observation.frame_id.clone(),
+            width: observation.width,
+            height: observation.height,
+        })
     }
 
     pub fn handle(&mut self, envelope: RequestEnvelope) -> ResponseEnvelope {
@@ -318,6 +380,10 @@ impl Engine {
                 envelope.request_id.clone(),
                 Ok(DaemonResponse::Profile(self.profile.clone())),
             ),
+            DaemonRequest::Status => response_from_result(
+                envelope.request_id.clone(),
+                Ok(DaemonResponse::Status(self.status())),
+            ),
             DaemonRequest::Observe(request) => {
                 let result = validate_settle_policy(request.settle)
                     .and_then(|()| self.observe(request.settle))
@@ -332,7 +398,142 @@ impl Engine {
                 self.cache_action(envelope.clone(), response.clone());
                 response
             }
+            DaemonRequest::Wait(_) => error_response(
+                envelope.request_id.clone(),
+                CuError::new(
+                    ErrorCode::ProtocolError,
+                    "wait requests require the daemon's cooperative wait path",
+                ),
+            ),
         }
+    }
+
+    /// Validate and initialize a cooperative wait against the latest frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CuError`] when no baseline exists, the supplied baseline is
+    /// stale, or the request is invalid for the baseline viewport.
+    pub fn begin_wait(&self, request: WaitRequest, now: Instant) -> Result<WaitTracker, CuError> {
+        let latest = self.latest.as_ref().ok_or_else(|| {
+            CuError::new(
+                ErrorCode::StaleFrame,
+                "observe the target before waiting for screen changes",
+            )
+        })?;
+        ensure_latest(&request.last_frame_id, &latest.observation.frame_id)?;
+        validate_wait_request(&request, latest.observation.viewport())?;
+
+        let viewport = latest.observation.viewport();
+        let watched = request.rect.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: viewport.width,
+            height: viewport.height,
+        });
+        let excluded = if latest.frame.resampled {
+            request
+                .exclude
+                .iter()
+                .copied()
+                .map(|rect| dilate_rect(rect, viewport, 3))
+                .collect()
+        } else {
+            request.exclude
+        };
+        if !has_watched_pixel(watched, &excluded) {
+            return Err(CuError::new(
+                ErrorCode::InvalidAction,
+                "padded exclude rectangles cover the entire watched rectangle",
+            ));
+        }
+
+        Ok(WaitTracker {
+            baseline_id: latest.observation.frame_id.clone(),
+            baseline: latest.frame.clone(),
+            watched,
+            excluded,
+            detection_deadline: now + Duration::from_millis(request.timeout_ms),
+            poll_interval: Duration::from_millis(request.poll_ms),
+            settle: request.settle,
+            phase: WaitPhase::Watching,
+        })
+    }
+
+    /// Capture one wait sample while holding the engine only for the capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CuError`] when the baseline was superseded, cancellation was
+    /// observed, or capture failed.
+    pub fn capture_wait_sample(
+        &mut self,
+        tracker: &WaitTracker,
+        cancelled: &AtomicBool,
+    ) -> Result<CapturedFrame, CuError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_error());
+        }
+        let latest = self.latest().ok_or_else(|| {
+            CuError::new(ErrorCode::StaleFrame, "the wait baseline is unavailable")
+        })?;
+        ensure_latest(&tracker.baseline_id, &latest.frame_id)?;
+        let frame = self.desktop.capture()?;
+        validate_captured_frame(&frame)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_error());
+        }
+        Ok(frame)
+    }
+
+    /// Publish the final changed sample after rechecking freshness and cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CuError`] when the baseline was superseded, cancellation was
+    /// observed, encoding failed, or the frame cannot be persisted.
+    pub fn publish_wait(
+        &mut self,
+        tracker: &WaitTracker,
+        publication: WaitPublication,
+        cancelled: &AtomicBool,
+    ) -> Result<WaitOutcome, CuError> {
+        let WaitPublication {
+            frame,
+            settled,
+            changed_pixels,
+            changed_bbox,
+            resolution_changed,
+        } = publication;
+        let latest = self.latest().ok_or_else(|| {
+            CuError::new(ErrorCode::StaleFrame, "the wait baseline is unavailable")
+        })?;
+        ensure_latest(&tracker.baseline_id, &latest.frame_id)?;
+        validate_captured_frame(&frame)?;
+        let png = encode_png(&frame)?;
+
+        let latest = self.latest().ok_or_else(|| {
+            CuError::new(ErrorCode::StaleFrame, "the wait baseline is unavailable")
+        })?;
+        ensure_latest(&tracker.baseline_id, &latest.frame_id)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_error());
+        }
+        self.frames.reserve_one()?;
+        let observation = self.persist_encoded_frame(frame, settled, &png)?;
+        if cancelled.load(Ordering::Acquire) {
+            eprintln!(
+                "screen-change wait published {} while its client disconnected during commit",
+                observation.frame_id
+            );
+        }
+        Ok(WaitOutcome {
+            changed: true,
+            changed_pixels,
+            changed_bbox,
+            resolution_changed,
+            observation: Some(observation),
+        })
     }
 
     fn observe(&mut self, settle: SettlePolicy) -> Result<Observation, CuError> {
@@ -342,7 +543,7 @@ impl Engine {
     }
 
     fn act(&mut self, request: &cu_protocol::ActRequest) -> Result<ActOutcome, CuError> {
-        let latest = self.latest.as_ref().ok_or_else(|| {
+        let latest = self.latest().ok_or_else(|| {
             CuError::new(
                 ErrorCode::StaleFrame,
                 "observe the target before the first action",
@@ -434,7 +635,7 @@ impl Engine {
         loop {
             thread::sleep(Duration::from_millis(policy.quiet_ms));
             let current = self.desktop.capture()?;
-            if current.png == previous.png {
+            if frames_equal(&current, &previous) {
                 return Ok((current, true));
             }
             previous = current;
@@ -449,19 +650,33 @@ impl Engine {
         frame: CapturedFrame,
         settled: bool,
     ) -> Result<Observation, CuError> {
+        validate_captured_frame(&frame)?;
+        let png = encode_png(&frame)?;
+        self.persist_encoded_frame(frame, settled, &png)
+    }
+
+    fn persist_encoded_frame(
+        &mut self,
+        frame: CapturedFrame,
+        settled: bool,
+        png: &[u8],
+    ) -> Result<Observation, CuError> {
         self.revision = self.revision.wrapping_add(1);
         let frame_id = format!("f_{}_{:016x}", self.session_id.simple(), self.revision);
-        let image_path = self.frames.persist(&frame_id, &frame.png)?;
+        let image_path = self.frames.persist(&frame_id, png)?;
         let observation = Observation {
             frame_id,
-            target: frame.target,
+            target: frame.target.clone(),
             width: frame.width,
             height: frame.height,
             coordinate_space: CoordinateSpace::FramePixels,
             settled,
             image_path: image_path.to_string_lossy().into_owned(),
         };
-        self.latest = Some(observation.clone());
+        self.latest = Some(PublishedFrame {
+            observation: observation.clone(),
+            frame,
+        });
         Ok(observation)
     }
 
@@ -480,6 +695,347 @@ impl Engine {
             }
         }
     }
+}
+
+impl WaitTracker {
+    #[must_use]
+    pub fn next_delay(&self, now: Instant) -> Duration {
+        match &self.phase {
+            WaitPhase::Watching => self
+                .poll_interval
+                .min(self.detection_deadline.saturating_duration_since(now)),
+            WaitPhase::Settling {
+                unchanged_since,
+                deadline,
+                ..
+            } => {
+                let quiet_remaining = (*unchanged_since
+                    + Duration::from_millis(self.settle.quiet_ms))
+                .saturating_duration_since(now);
+                let cadence = self
+                    .poll_interval
+                    .min(quiet_remaining)
+                    .max(Duration::from_millis(cu_protocol::MIN_WAIT_POLL_MS));
+                cadence.min(deadline.saturating_duration_since(now))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_detection_timed_out(&self, now: Instant) -> bool {
+        matches!(self.phase, WaitPhase::Watching) && now >= self.detection_deadline
+    }
+
+    #[must_use]
+    pub fn timed_out_outcome(&self) -> WaitOutcome {
+        WaitOutcome {
+            changed: false,
+            changed_pixels: Some(0),
+            changed_bbox: None,
+            resolution_changed: false,
+            observation: None,
+        }
+    }
+
+    #[must_use]
+    pub fn observe_sample(&mut self, frame: CapturedFrame, now: Instant) -> WaitStep {
+        match &mut self.phase {
+            WaitPhase::Watching => {
+                if now >= self.detection_deadline {
+                    return WaitStep::TimedOut(self.timed_out_outcome());
+                }
+                let difference =
+                    compare_frames(&self.baseline, &frame, self.watched, &self.excluded);
+                if !difference.changed() {
+                    return WaitStep::Pending;
+                }
+                if difference.resolution_changed {
+                    return WaitStep::Publish(WaitPublication {
+                        frame,
+                        settled: false,
+                        changed_pixels: None,
+                        changed_bbox: None,
+                        resolution_changed: true,
+                    });
+                }
+                self.phase = WaitPhase::Settling {
+                    previous: frame,
+                    unchanged_since: now,
+                    deadline: now + Duration::from_millis(self.settle.timeout_ms),
+                };
+                WaitStep::Pending
+            }
+            WaitPhase::Settling {
+                previous,
+                unchanged_since,
+                deadline,
+            } => {
+                let difference =
+                    compare_frames(&self.baseline, &frame, self.watched, &self.excluded);
+                if !difference.changed() {
+                    self.phase = WaitPhase::Watching;
+                    return if now >= self.detection_deadline {
+                        WaitStep::TimedOut(self.timed_out_outcome())
+                    } else {
+                        WaitStep::Pending
+                    };
+                }
+                if difference.resolution_changed {
+                    return WaitStep::Publish(WaitPublication {
+                        frame,
+                        settled: false,
+                        changed_pixels: None,
+                        changed_bbox: None,
+                        resolution_changed: true,
+                    });
+                }
+
+                if masked_pixels_equal(previous, &frame, self.watched, &self.excluded) {
+                    if now.saturating_duration_since(*unchanged_since)
+                        >= Duration::from_millis(self.settle.quiet_ms)
+                    {
+                        return WaitStep::Publish(WaitPublication {
+                            frame,
+                            settled: true,
+                            changed_pixels: difference.changed_pixels,
+                            changed_bbox: difference.changed_bbox,
+                            resolution_changed: false,
+                        });
+                    }
+                } else {
+                    *previous = frame.clone();
+                    *unchanged_since = now;
+                }
+
+                if now >= *deadline {
+                    WaitStep::Publish(WaitPublication {
+                        frame,
+                        settled: false,
+                        changed_pixels: difference.changed_pixels,
+                        changed_bbox: difference.changed_bbox,
+                        resolution_changed: false,
+                    })
+                } else {
+                    WaitStep::Pending
+                }
+            }
+        }
+    }
+}
+
+struct FrameDifference {
+    changed_pixels: Option<u64>,
+    changed_bbox: Option<Rect>,
+    resolution_changed: bool,
+}
+
+impl FrameDifference {
+    fn changed(&self) -> bool {
+        self.resolution_changed || self.changed_pixels.is_some_and(|count| count > 0)
+    }
+}
+
+fn compare_frames(
+    baseline: &CapturedFrame,
+    current: &CapturedFrame,
+    watched: Rect,
+    excluded: &[Rect],
+) -> FrameDifference {
+    if baseline.width != current.width || baseline.height != current.height {
+        return FrameDifference {
+            changed_pixels: None,
+            changed_bbox: None,
+            resolution_changed: true,
+        };
+    }
+
+    let mut changed_pixels = 0_u64;
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0_u32;
+    let mut max_y = 0_u32;
+    for y in watched.y..watched.y + watched.height {
+        for x in watched.x..watched.x + watched.width {
+            if excluded.iter().any(|rect| rect_contains(*rect, x, y)) {
+                continue;
+            }
+            let offset = pixel_offset(baseline.width, x, y);
+            if baseline.pixels[offset..offset + 3] != current.pixels[offset..offset + 3] {
+                changed_pixels += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    let changed_bbox = if changed_pixels > 0 {
+        Some(Rect {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        })
+    } else {
+        None
+    };
+    FrameDifference {
+        changed_pixels: Some(changed_pixels),
+        changed_bbox,
+        resolution_changed: false,
+    }
+}
+
+fn masked_pixels_equal(
+    first: &CapturedFrame,
+    second: &CapturedFrame,
+    watched: Rect,
+    excluded: &[Rect],
+) -> bool {
+    if first.width != second.width || first.height != second.height {
+        return false;
+    }
+    for y in watched.y..watched.y + watched.height {
+        for x in watched.x..watched.x + watched.width {
+            if excluded.iter().any(|rect| rect_contains(*rect, x, y)) {
+                continue;
+            }
+            let offset = pixel_offset(first.width, x, y);
+            if first.pixels[offset..offset + 3] != second.pixels[offset..offset + 3] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn frames_equal(first: &CapturedFrame, second: &CapturedFrame) -> bool {
+    first.width == second.width && first.height == second.height && first.pixels == second.pixels
+}
+
+fn pixel_offset(width: u32, x: u32, y: u32) -> usize {
+    usize::try_from(u64::from(y) * u64::from(width) + u64::from(x))
+        .expect("validated RGB frame fits the address space")
+        * 3
+}
+
+fn validate_captured_frame(frame: &CapturedFrame) -> Result<(), CuError> {
+    let expected = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|bytes| usize::try_from(bytes).ok());
+    if frame.width == 0 || frame.height == 0 || expected != Some(frame.pixels.len()) {
+        return Err(CuError::new(
+            ErrorCode::CaptureFailed,
+            "captured RGB frame has invalid dimensions or byte length",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_png(frame: &CapturedFrame) -> Result<Vec<u8>, CuError> {
+    let image =
+        RgbImage::from_raw(frame.width, frame.height, frame.pixels.to_vec()).ok_or_else(|| {
+            CuError::new(
+                ErrorCode::CaptureFailed,
+                "captured RGB frame cannot be represented as an image",
+            )
+        })?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut png, ImageFormat::Png)
+        .map_err(|error| {
+            CuError::new(
+                ErrorCode::CaptureFailed,
+                format!("failed to encode screenshot as PNG: {error}"),
+            )
+        })?;
+    Ok(png.into_inner())
+}
+
+fn ensure_latest(expected: &str, actual: &str) -> Result<(), CuError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(CuError::new(
+            ErrorCode::StaleFrame,
+            format!("expected {expected}, but the latest frame is {actual}"),
+        ))
+    }
+}
+
+fn cancelled_error() -> CuError {
+    CuError::new(ErrorCode::Cancelled, "screen-change wait was cancelled")
+}
+
+fn dilate_rect(rect: Rect, viewport: Viewport, padding: u32) -> Rect {
+    let x = rect.x.saturating_sub(padding);
+    let y = rect.y.saturating_sub(padding);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(padding)
+        .min(viewport.width);
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(padding)
+        .min(viewport.height);
+    Rect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+fn has_watched_pixel(watched: Rect, excluded: &[Rect]) -> bool {
+    !rect_is_fully_covered(watched, excluded)
+}
+
+fn rect_is_fully_covered(watched: Rect, excluded: &[Rect]) -> bool {
+    let watched_right = watched.x + watched.width;
+    let watched_bottom = watched.y + watched.height;
+    let mut y_edges = vec![watched.y, watched_bottom];
+    for rect in excluded {
+        let top = rect.y.max(watched.y);
+        let bottom = (rect.y + rect.height).min(watched_bottom);
+        if top < bottom {
+            y_edges.push(top);
+            y_edges.push(bottom);
+        }
+    }
+    y_edges.sort_unstable();
+    y_edges.dedup();
+
+    y_edges.windows(2).all(|band| {
+        let y = band[0];
+        let mut intervals = excluded
+            .iter()
+            .filter(|rect| y >= rect.y && y < rect.y + rect.height)
+            .filter_map(|rect| {
+                let left = rect.x.max(watched.x);
+                let right = (rect.x + rect.width).min(watched_right);
+                (left < right).then_some((left, right))
+            })
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut covered_until = watched.x;
+        for (left, right) in intervals {
+            if left > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(right);
+            if covered_until >= watched_right {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+fn rect_contains(rect: Rect, x: u32, y: u32) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
 struct FrameStore {
@@ -882,10 +1438,64 @@ mod tests {
 
     fn frame(value: u8) -> CapturedFrame {
         CapturedFrame {
-            png: vec![value],
+            pixels: Arc::from(vec![value; 100 * 80 * 3]),
             width: 100,
             height: 80,
             target: "mock:screen".to_owned(),
+            resampled: false,
+        }
+    }
+
+    fn small_frame(value: u8) -> CapturedFrame {
+        CapturedFrame {
+            pixels: Arc::from(vec![value; 8 * 6 * 3]),
+            width: 8,
+            height: 6,
+            target: "mock:small".to_owned(),
+            resampled: false,
+        }
+    }
+
+    fn resized_frame(value: u8) -> CapturedFrame {
+        CapturedFrame {
+            pixels: Arc::from(vec![value; 9 * 6 * 3]),
+            width: 9,
+            height: 6,
+            target: "mock:small".to_owned(),
+            resampled: false,
+        }
+    }
+
+    fn with_pixel(frame: &CapturedFrame, x: u32, y: u32, value: u8) -> CapturedFrame {
+        let mut changed = frame.clone();
+        let mut pixels = changed.pixels.to_vec();
+        let offset = pixel_offset(changed.width, x, y);
+        pixels[offset..offset + 3].fill(value);
+        changed.pixels = Arc::from(pixels);
+        changed
+    }
+
+    fn wait_request(frame_id: String) -> WaitRequest {
+        WaitRequest {
+            last_frame_id: frame_id,
+            rect: Some(Rect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 3,
+            }),
+            exclude: vec![Rect {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1,
+            }],
+            timeout_ms: 1_000,
+            poll_ms: 100,
+            settle: SettlePolicy {
+                quiet_ms: 100,
+                timeout_ms: 300,
+            },
         }
     }
 
@@ -944,6 +1554,309 @@ mod tests {
             )))
         );
         assert!(engine.latest().is_none());
+    }
+
+    #[test]
+    fn status_returns_the_latest_frame_without_capturing() {
+        let directory = TempDir::new().unwrap();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let baseline = small_frame(1);
+        let mut engine = engine(&directory, vec![baseline.clone(), baseline], executed);
+        let observed = observe(&mut engine);
+
+        let response = engine.handle(RequestEnvelope {
+            request_id: "status-1".to_owned(),
+            request: DaemonRequest::Status,
+        });
+
+        let ResponseResult::Ok(DaemonResponse::Status(Some(status))) = response.result else {
+            panic!("expected frame status");
+        };
+        assert_eq!(status.frame_id, observed.frame_id);
+        assert_eq!((status.width, status.height), (8, 6));
+    }
+
+    #[test]
+    fn wait_timeout_publishes_nothing_and_preserves_the_baseline() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline.clone()],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let mut tracker = engine
+            .begin_wait(wait_request(observed.frame_id.clone()), start)
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_sample(baseline.clone(), start + Duration::from_millis(500)),
+            WaitStep::Pending
+        ));
+        let WaitStep::TimedOut(outcome) =
+            tracker.observe_sample(baseline, start + Duration::from_secs(1))
+        else {
+            panic!("expected unchanged timeout");
+        };
+
+        assert!(!outcome.changed);
+        assert!(outcome.observation.is_none());
+        assert_eq!(engine.latest().unwrap().frame_id, observed.frame_id);
+        assert_eq!(
+            fs::read_dir(directory.path().join("frames"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension() == Some(OsStr::new("png")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn wait_ignores_outside_and_excluded_pixels_then_reports_the_change_bbox() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline.clone()],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let mut tracker = engine
+            .begin_wait(wait_request(observed.frame_id.clone()), start)
+            .unwrap();
+
+        assert!(matches!(
+            tracker.observe_sample(
+                with_pixel(&baseline, 0, 0, 2),
+                start + Duration::from_millis(100)
+            ),
+            WaitStep::Pending
+        ));
+        assert!(matches!(
+            tracker.observe_sample(
+                with_pixel(&baseline, 3, 3, 2),
+                start + Duration::from_millis(200)
+            ),
+            WaitStep::Pending
+        ));
+        let changed = with_pixel(&baseline, 2, 2, 2);
+        assert!(matches!(
+            tracker.observe_sample(changed.clone(), start + Duration::from_millis(300)),
+            WaitStep::Pending
+        ));
+        let WaitStep::Publish(WaitPublication {
+            frame,
+            settled,
+            changed_pixels,
+            changed_bbox,
+            resolution_changed,
+        }) = tracker.observe_sample(changed, start + Duration::from_millis(400))
+        else {
+            panic!("expected settled change");
+        };
+        let outcome = engine
+            .publish_wait(
+                &tracker,
+                WaitPublication {
+                    frame,
+                    settled,
+                    changed_pixels,
+                    changed_bbox,
+                    resolution_changed,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.changed_pixels, Some(1));
+        assert_eq!(
+            outcome.changed_bbox,
+            Some(Rect {
+                x: 2,
+                y: 2,
+                width: 1,
+                height: 1
+            })
+        );
+        assert!(outcome.observation.unwrap().settled);
+    }
+
+    #[test]
+    fn wait_revert_returns_to_watching_and_flicker_can_publish_unsettled() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline.clone()],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let mut tracker = engine
+            .begin_wait(wait_request(observed.frame_id.clone()), start)
+            .unwrap();
+        let first = with_pixel(&baseline, 2, 2, 2);
+        assert!(matches!(
+            tracker.observe_sample(first, start + Duration::from_millis(100)),
+            WaitStep::Pending
+        ));
+        assert!(matches!(
+            tracker.observe_sample(baseline.clone(), start + Duration::from_millis(150)),
+            WaitStep::Pending
+        ));
+
+        let second = with_pixel(&baseline, 2, 2, 3);
+        assert!(matches!(
+            tracker.observe_sample(second.clone(), start + Duration::from_millis(200)),
+            WaitStep::Pending
+        ));
+        let third = with_pixel(&baseline, 2, 2, 4);
+        assert!(matches!(
+            tracker.observe_sample(third, start + Duration::from_millis(350)),
+            WaitStep::Pending
+        ));
+        let WaitStep::Publish(WaitPublication { settled, .. }) =
+            tracker.observe_sample(second, start + Duration::from_millis(500))
+        else {
+            panic!("expected settle-timeout publication");
+        };
+        assert!(!settled);
+    }
+
+    #[test]
+    fn wait_rejects_stale_baselines_before_capture_and_after_supersession() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let newer = small_frame(2);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline, newer.clone(), newer],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let error = engine
+            .begin_wait(wait_request("f_old".to_owned()), start)
+            .err()
+            .expect("stale begin must fail");
+        assert_eq!(error.code, ErrorCode::StaleFrame);
+
+        let tracker = engine
+            .begin_wait(wait_request(observed.frame_id), start)
+            .unwrap();
+        let _ = observe(&mut engine);
+        let error = engine
+            .capture_wait_sample(&tracker, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::StaleFrame);
+    }
+
+    #[test]
+    fn resolution_change_is_immediate_and_publish_checks_cancellation() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let mut tracker = engine
+            .begin_wait(wait_request(observed.frame_id.clone()), start)
+            .unwrap();
+        let WaitStep::Publish(
+            publication @ WaitPublication {
+                settled,
+                resolution_changed,
+                ..
+            },
+        ) = tracker.observe_sample(resized_frame(1), start + Duration::from_millis(100))
+        else {
+            panic!("expected resolution-change publication");
+        };
+        assert!(resolution_changed);
+        assert!(!settled);
+        let cancelled = AtomicBool::new(true);
+        let error = engine
+            .publish_wait(&tracker, publication, &cancelled)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(engine.latest().unwrap().frame_id, observed.frame_id);
+    }
+
+    #[test]
+    fn repeated_changed_waits_respect_frame_retention() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(0);
+        let mut engine = engine_with_max(
+            &directory,
+            vec![baseline.clone(), baseline],
+            Arc::new(Mutex::new(Vec::new())),
+            2,
+        );
+        let mut observed = observe(&mut engine);
+        let cancelled = AtomicBool::new(false);
+
+        for value in 1..=3 {
+            let start = Instant::now();
+            let mut tracker = engine
+                .begin_wait(wait_request(observed.frame_id), start)
+                .unwrap();
+            let changed = small_frame(value);
+            assert!(matches!(
+                tracker.observe_sample(changed.clone(), start + Duration::from_millis(100)),
+                WaitStep::Pending
+            ));
+            let WaitStep::Publish(publication) =
+                tracker.observe_sample(changed, start + Duration::from_millis(200))
+            else {
+                panic!("expected changed publication");
+            };
+            observed = engine
+                .publish_wait(&tracker, publication, &cancelled)
+                .unwrap()
+                .observation
+                .unwrap();
+        }
+
+        assert_eq!(
+            fs::read_dir(directory.path().join("frames"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension() == Some(OsStr::new("png")))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn exclusion_dilation_clamps_to_the_frame() {
+        assert_eq!(
+            dilate_rect(
+                Rect {
+                    x: 1,
+                    y: 1,
+                    width: 8,
+                    height: 8,
+                },
+                Viewport {
+                    width: 10,
+                    height: 10,
+                },
+                3,
+            ),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }
+        );
     }
 
     #[test]

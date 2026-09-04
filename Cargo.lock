@@ -286,6 +286,7 @@ name = "cu-core"
 version = "0.2.0"
 dependencies = [
  "cu-protocol",
+ "image",
  "rustix",
  "tempfile",
  "uuid",

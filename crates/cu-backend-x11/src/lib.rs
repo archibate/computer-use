@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::Cursor,
+    sync::Arc,
     thread,
     time::Duration,
 };
 
 use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage, imageops::FilterType};
+use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
 use x11rb::{
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NO_SYMBOL, NONE,
     connection::Connection,
@@ -187,14 +187,15 @@ impl X11Backend {
         }
 
         let frame = self.capture_limits.fit(rgb.width(), rgb.height());
-        let image = if frame.width == rgb.width() && frame.height == rgb.height() {
-            DynamicImage::ImageRgb8(rgb)
-        } else {
+        let resampled = frame.width != rgb.width() || frame.height != rgb.height();
+        let image = if resampled {
             DynamicImage::ImageRgb8(rgb).resize_exact(
                 frame.width,
                 frame.height,
                 FilterType::Lanczos3,
             )
+        } else {
+            DynamicImage::ImageRgb8(rgb)
         };
         self.transform = Some(CoordinateTransform {
             frame,
@@ -204,15 +205,12 @@ impl X11Backend {
             },
         });
 
-        let mut png = Cursor::new(Vec::new());
-        image
-            .write_to(&mut png, ImageFormat::Png)
-            .map_err(capture_error)?;
         Ok(CapturedFrame {
-            png: png.into_inner(),
+            pixels: Arc::from(image.to_rgb8().into_raw()),
             width: frame.width,
             height: frame.height,
             target: format!("x11:{}:screen:{}", self.display, self.screen_index),
+            resampled,
         })
     }
 
