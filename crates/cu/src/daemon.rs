@@ -209,16 +209,13 @@ async fn run_wait(
 ) -> Result<WaitOutcome, CuError> {
     let begin_engine = Arc::clone(&engine);
     let mut tracker = tokio::task::spawn_blocking(move || {
-        lock_engine(&begin_engine)?.begin_wait(request, Instant::now())
+        lock_engine(&begin_engine)?.begin_wait(&request, Instant::now())
     })
     .await
     .map_err(|error| join_error(&error))??;
 
     loop {
         let now = Instant::now();
-        if tracker.is_detection_timed_out(now) {
-            return Ok(tracker.timed_out_outcome());
-        }
         tokio::time::sleep(tracker.next_delay(now)).await;
         if cancelled.load(Ordering::Acquire) {
             return Err(CuError::new(
@@ -239,7 +236,7 @@ async fn run_wait(
         tracker = returned;
         let sample = sample?;
 
-        match tracker.observe_sample(sample, Instant::now()) {
+        match tracker.observe_sample(sample, Instant::now())? {
             WaitStep::Pending => {}
             WaitStep::TimedOut(outcome) => return Ok(outcome),
             WaitStep::Publish(publication) => {
@@ -370,14 +367,17 @@ mod tests {
     fn wait_request(frame_id: String, timeout_ms: u64) -> WaitRequest {
         WaitRequest {
             last_frame_id: frame_id,
-            rect: None,
-            exclude: Vec::new(),
+            include_rects: vec![cu_protocol::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            }],
+            exclude_rects: Vec::new(),
             timeout_ms,
-            poll_ms: 100,
-            settle: SettlePolicy {
-                quiet_ms: 100,
-                timeout_ms: 300,
-            },
+            coalesce_ms: 100,
+            quiet_ms: 100,
+            settle_max_ms: 300,
         }
     }
 

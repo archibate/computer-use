@@ -125,46 +125,45 @@ Coordinates are pixels in the returned, possibly downscaled frame. Supported
 actions are `move`, `click`, `double_click`, `drag`, `scroll`, `type`, and
 `keypress`. A batch contains at most 16 actions.
 
-To wait without keeping an agent turn active, read the current published
-baseline without taking another screenshot, then start a bounded wait:
+To wait for screen activity without repeatedly capturing in an agent loop, read
+the current published baseline without taking another screenshot, then start a
+bounded wait:
 
 ```sh
 frame_id=$(cu status | jq -er '.result.ok.result.frame_id')
 cu wait --last-frame-id "$frame_id" \
-  --rect 780,120,800,720 \
+  --include 780,120,800,720 \
+  --include 40,120,700,720 \
   --exclude 1490,120,80,30 \
-  --timeout-ms 30000
+  --timeout-ms 600000 \
+  --coalesce-ms 30000 \
+  --quiet-ms 1000 \
+  --settle-max-ms 45000
 ```
 
 If the daemon has not published a frame since startup, `cu status` returns
 `null`; run one observe first. After upgrading a running daemon, restart it
 before using the new status or wait protocol variants.
 
-`--rect` selects `x,y,width,height`; omitting it watches the whole frame.
-Repeat `--exclude` for carets, animated emoji, clocks, or other known noisy
-areas. Comparison is exact RGB over the watched pixels minus exclusions. When
-captures are downscaled, each exclusion is padded outward by three frame
-pixels to absorb resampling bleed.
+Repeat `--include` for 1-8 regions and `--exclude` for up to 8 carets,
+animations, clocks, or other known noise. Comparison is exact RGB over the
+union of included rectangles minus the union of exclusions. Rectangles use
+baseline-frame `x,y,width,height` coordinates.
 
-An unchanged timeout returns `changed:false` without publishing or evicting a
-frame, so an outer watcher may call `cu wait` again with the same baseline. A
-change returns a fresh observation plus `changed_pixels`, `changed_bbox`, and
-`resolution_changed`; `settled` describes the watched, non-excluded pixels.
-Any concurrent observe, act, or changed wait supersedes the baseline and makes
-other waits return `stale_frame`. At most four waits run concurrently; excess
-requests return `busy`. Detection polls every 500 ms by default (minimum 100
-ms), and the worst-case return time includes the detection timeout,
-post-change settle timeout, and one capture.
+The first change latches the wait. `coalesce_ms` is a minimum batching window
+from that change, while `quiet_ms` must pass without another monitored pixel
+change. Both are capped by `settle_max_ms`; reaching the cap publishes the
+latest frame with `settled:false`. The defaults are 2000 ms coalescing, 1000 ms
+quiet, and a 15000 ms settle cap. The daemon samples every 500 ms internally.
 
-This CLI operation is intended for an outer session watcher such as
-`monitor-wakeup`: loop across unchanged bounded timeouts, queue one static wake
-signal only after `changed:true`, then exit. Cancellation should simply drop the
-CLI process; the daemon notices the disconnect and stops polling. After wake-up,
-observe again before acting. `cu wait` is deliberately not an MCP tool because
-a long MCP call would keep the agent turn active. When several watchers feed one
-Codex thread, the changed watcher queues the single wake-up and stale sibling
-watchers exit quietly; the resumed turn observes all monitored regions before
-re-arming them.
+An unchanged timeout returns `status:"timeout"`, `elapsed_ms`, and the same
+`frame_id`, without an image or frame-store publication. It can be re-armed
+against that baseline. Activity returns `status:"changed"`, the accumulated
+`activity_bbox`, and a fresh observation. A viewport-size change returns
+`viewport_changed` with expected and actual dimensions and requires another
+observe. Any concurrent observe, act, or changed wait supersedes the baseline
+and makes other waits stale. At most four waits run concurrently; excess
+requests return `busy`. Dropping the CLI process cancels its daemon wait.
 
 ## MCP
 
@@ -184,21 +183,44 @@ Claude Code (user scope, available across projects):
 claude mcp add --scope user --transport stdio cu -- cu mcp
 ```
 
-It exposes two tools:
+It exposes three tools:
 
 - `computer_observe` returns a session-local integer `frame`, dimensions,
   settling status, and a PNG image.
 - `computer_act` requires that latest `frame`, executes a validated batch, and
   returns execution metadata plus the next numbered observation and PNG.
+- `computer_wait` requires that latest `frame`, watches 1-8 included regions
+  minus optional exclusions, and blocks without repeated model polling. A
+  changed result returns the next numbered observation and native PNG; an
+  unchanged timeout returns no image and preserves the supplied frame.
 
 The published schemas describe every action, coordinate and key convention,
 settling limits, partial execution, and stale-frame recovery.
 
-MCP frame numbers start at 1, increase for each distinct result, and are valid
-only within that MCP process. The adapter maps them to the daemon's opaque frame
-IDs, which remain part of the CLI and daemon protocols but are not exposed to
-the agent. Call `computer_observe` again after `stale_frame`, cancellation, or a
-timed-out call.
+MCP frame numbers start at 1, increase for each distinct observation, and are
+valid only within that MCP process. The adapter maps them to the daemon's opaque
+frame IDs, which remain part of the CLI and daemon protocols but are not exposed
+to the agent. Re-arm an unchanged timeout with the same frame; use the fresh
+frame after a changed result. Call `computer_observe` after `stale_frame`,
+cancellation, or `viewport_changed`.
+
+`computer_wait` emits rate-limited progress notifications when the MCP client
+supplies a progress token and propagates request cancellation by dropping the
+daemon connection. Its worst-case duration is approximately `timeout_ms +
+settle_max_ms` plus capture and PNG encoding. Configure the MCP host's tool
+deadline above that bound. For example, a ten-minute Codex wait with a 45-second
+settle cap needs headroom such as:
+
+```toml
+[mcp_servers.cu]
+command = "cu"
+args = ["mcp"]
+tool_timeout_sec = 660
+```
+
+Repeated changed results with unexpectedly small `elapsed_ms` indicate an
+active included region. Narrow the includes or exclude blinking cursors and
+unrelated animation before re-arming.
 
 The engine rejects stale frames before input, validates the complete batch
 before its first side effect, executes actions in order, and captures state

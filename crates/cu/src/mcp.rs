@@ -7,13 +7,18 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cu_protocol::{
-    ActOutcome, ActRequest, ActStatus, Action, CuError, DaemonRequest, DaemonResponse, ErrorCode,
-    Observation, ObserveRequest, RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy,
+    ActOutcome, ActRequest, ActStatus, Action, CuError, DEFAULT_WAIT_COALESCE_MS,
+    DEFAULT_WAIT_QUIET_MS, DEFAULT_WAIT_SETTLE_MS, DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest,
+    DaemonResponse, ErrorCode, Observation, ObserveRequest, Rect, RequestEnvelope,
+    ResponseEnvelope, ResponseResult, SettlePolicy, WaitOutcome, WaitRequest, WaitStatus,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{tool::RequestId, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ProgressNotificationParam,
+        ServerCapabilities, ServerInfo,
+    },
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -21,13 +26,14 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::client;
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation; ground the next action in that image. Batch actions only when no intermediate inspection is needed. After stale_frame, a cancelled or timed-out call, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait pauses without repeated observation calls: an unchanged timeout returns no image and preserves its frame, while detected activity returns a fresh observation and PNG. Re-arm a timed-out wait with the same frame or a changed wait with its returned frame. Repeated waits with unexpectedly small elapsed_ms usually indicate that an included region contains irrelevant motion; narrow include_rects or exclude carets and animations. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
 const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -44,9 +50,56 @@ struct McpActRequest {
     settle: SettlePolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(title = "computer wait input")]
+struct McpWaitRequest {
+    /// Session-local frame number from the latest observation or changed wait.
+    #[schemars(range(min = 1))]
+    frame: u64,
+    /// Between 1 and 8 rectangles whose union is watched for exact pixel changes.
+    #[schemars(length(min = 1, max = 8))]
+    include_rects: Vec<Rect>,
+    /// Up to 8 rectangles removed from the included region.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 8))]
+    exclude_rects: Vec<Rect>,
+    /// Maximum time to detect the first change; defaults to 30000 ms.
+    #[serde(default = "default_wait_timeout_ms")]
+    #[schemars(range(min = 1, max = 600_000))]
+    timeout_ms: u64,
+    /// Minimum batching window after the first change; defaults to 2000 ms.
+    #[serde(default = "default_wait_coalesce_ms")]
+    #[schemars(range(min = 0, max = 60_000))]
+    coalesce_ms: u64,
+    /// Required continuous stability after activity; defaults to 1000 ms.
+    #[serde(default = "default_wait_quiet_ms")]
+    #[schemars(range(min = 1, max = 10_000))]
+    quiet_ms: u64,
+    /// Hard post-change limit; defaults to 15000 ms.
+    #[serde(default = "default_wait_settle_ms")]
+    #[schemars(range(min = 1, max = 120_000))]
+    settle_max_ms: u64,
+}
+
+const fn default_wait_timeout_ms() -> u64 {
+    DEFAULT_WAIT_TIMEOUT_MS
+}
+
+const fn default_wait_coalesce_ms() -> u64 {
+    DEFAULT_WAIT_COALESCE_MS
+}
+
+const fn default_wait_quiet_ms() -> u64 {
+    DEFAULT_WAIT_QUIET_MS
+}
+
+const fn default_wait_settle_ms() -> u64 {
+    DEFAULT_WAIT_SETTLE_MS
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct McpObservation {
-    /// Session-local frame number required by the next `computer_act` call.
+    /// Session-local frame number required by the next act or wait call.
     #[schemars(range(min = 1))]
     frame: u64,
     /// PNG width and exclusive upper bound for action x coordinates.
@@ -66,6 +119,23 @@ impl McpObservation {
             settled: observation.settled,
         }
     }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct McpWaitOutcome {
+    /// Whether monitored activity was observed or the unchanged timeout elapsed.
+    status: WaitStatus,
+    /// Monotonic time through the terminal screen sample; excludes result encoding and transport.
+    elapsed_ms: u64,
+    /// Current session-local frame: unchanged on timeout and new after activity.
+    #[schemars(range(min = 1))]
+    frame: u64,
+    /// Bounding box covering monitored activity since the first change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_bbox: Option<Rect>,
+    /// Fresh frame metadata after activity; absent on timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<McpObservation>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -153,6 +223,28 @@ struct McpSessionState {
 }
 
 impl McpSessionState {
+    fn resolve_frame(&self, frame: u64) -> Result<FrameBinding, CuError> {
+        if frame == 0 {
+            return Err(CuError::new(
+                ErrorCode::InvalidAction,
+                "frame must be a positive integer",
+            ));
+        }
+        let current = self.current.as_ref().ok_or_else(|| {
+            CuError::new(
+                ErrorCode::StaleFrame,
+                "no current screenshot in this MCP session; call computer_observe",
+            )
+        })?;
+        if frame != current.frame {
+            return Err(CuError::new(
+                ErrorCode::StaleFrame,
+                "the supplied frame is no longer current; call computer_observe",
+            ));
+        }
+        Ok(current.clone())
+    }
+
     fn prepare_action(
         &mut self,
         request_id: &str,
@@ -167,27 +259,10 @@ impl McpSessionState {
                 "request_id was reused with a different request",
             ));
         }
-        if request.frame == 0 {
-            return Err(CuError::new(
-                ErrorCode::InvalidAction,
-                "frame must be a positive integer",
-            ));
-        }
-        let current = self.current.as_ref().ok_or_else(|| {
-            CuError::new(
-                ErrorCode::StaleFrame,
-                "no current screenshot in this MCP session; call computer_observe",
-            )
-        })?;
-        if request.frame != current.frame {
-            return Err(CuError::new(
-                ErrorCode::StaleFrame,
-                "the supplied frame is no longer current; call computer_observe",
-            ));
-        }
+        let current = self.resolve_frame(request.frame)?;
 
         let protocol_request = ActRequest {
-            expected_frame_id: current.internal_id.clone(),
+            expected_frame_id: current.internal_id,
             actions: request.actions.clone(),
             settle: request.settle,
         };
@@ -247,6 +322,26 @@ impl McpSessionState {
         Ok(binding)
     }
 
+    fn bind_wait_observation(
+        &mut self,
+        baseline: &FrameBinding,
+        internal_id: String,
+    ) -> Result<FrameBinding, CuError> {
+        self.ensure_current(baseline)?;
+        self.bind_observation(internal_id)
+    }
+
+    fn ensure_current(&self, expected: &FrameBinding) -> Result<(), CuError> {
+        if self.current.as_ref() == Some(expected) {
+            Ok(())
+        } else {
+            Err(CuError::new(
+                ErrorCode::StaleFrame,
+                "the wait frame was superseded; use the latest returned observation or observe again",
+            ))
+        }
+    }
+
     fn commit(&mut self, binding: FrameBinding) {
         if binding.frame == self.latest_frame {
             self.current = Some(binding);
@@ -255,6 +350,12 @@ impl McpSessionState {
 
     fn clear(&mut self) {
         self.current = None;
+    }
+
+    fn clear_if_current(&mut self, expected: &FrameBinding) {
+        if self.current.as_ref() == Some(expected) {
+            self.clear();
+        }
     }
 
     fn apply_error(&mut self, error: &CuError) {
@@ -268,6 +369,17 @@ impl McpSessionState {
             self.clear();
         }
     }
+}
+
+fn wait_error_invalidates_frame(code: ErrorCode) -> bool {
+    !matches!(
+        code,
+        ErrorCode::StaleFrame
+            | ErrorCode::InvalidAction
+            | ErrorCode::OutOfBounds
+            | ErrorCode::UnsupportedInput
+            | ErrorCode::ProtocolError
+    )
 }
 
 #[derive(Clone)]
@@ -360,6 +472,77 @@ impl ComputerUseMcp {
             ResponseResult::Ok(_) => {
                 state.clear();
                 Ok(unexpected_response("observe"))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Wait for exact RGB pixel activity in the union of include_rects minus exclude_rects, relative to the supplied current frame. After the first change, coalesce activity and require a quiet interval, bounded by settle_max_ms. A changed result returns a fresh frame and PNG; an unchanged timeout returns no image and preserves the supplied frame. Repeated short waits suggest narrowing include_rects or excluding carets and animations.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<McpWaitOutcome>(),
+        annotations(
+            title = "Wait for computer change",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn computer_wait(
+        &self,
+        Parameters(request): Parameters<McpWaitRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if context.ct.is_cancelled() {
+            return Ok(cancelled_result());
+        }
+        let baseline = {
+            let state = self.state.lock().await;
+            match state.resolve_frame(request.frame) {
+                Ok(binding) => binding,
+                Err(error) => return Ok(structured_error(&error)),
+            }
+        };
+        let protocol_request = WaitRequest {
+            last_frame_id: baseline.internal_id.clone(),
+            include_rects: request.include_rects,
+            exclude_rects: request.exclude_rects,
+            timeout_ms: request.timeout_ms,
+            coalesce_ms: request.coalesce_ms,
+            quiet_ms: request.quiet_ms,
+            settle_max_ms: request.settle_max_ms,
+        };
+        let response = match self.request_wait_daemon(protocol_request, &context).await {
+            Ok(response) => response,
+            Err(result) => {
+                self.state.lock().await.clear_if_current(&baseline);
+                return Ok(result);
+            }
+        };
+        if context.ct.is_cancelled() {
+            self.state.lock().await.clear_if_current(&baseline);
+            return Ok(cancelled_result());
+        }
+
+        match response.result {
+            ResponseResult::Error(error) => {
+                let mut state = self.state.lock().await;
+                if wait_error_invalidates_frame(error.code) {
+                    state.clear_if_current(&baseline);
+                }
+                if error.code == ErrorCode::StaleFrame {
+                    Ok(stale_frame_result(
+                        "the desktop was superseded while waiting; call computer_observe",
+                    ))
+                } else {
+                    Ok(structured_error(&error))
+                }
+            }
+            ResponseResult::Ok(DaemonResponse::Wait(outcome)) => {
+                self.finish_wait(outcome, baseline, &context).await
+            }
+            ResponseResult::Ok(_) => {
+                self.state.lock().await.clear_if_current(&baseline);
+                Ok(unexpected_response("wait"))
             }
         }
     }
@@ -488,6 +671,111 @@ impl ComputerUseMcp {
                 "code": "daemon_unavailable",
                 "message": error.to_string(),
             }))),
+        }
+    }
+
+    async fn request_wait_daemon(
+        &self,
+        request: WaitRequest,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<ResponseEnvelope, CallToolResult> {
+        let request = self.request_daemon(Uuid::new_v4().to_string(), DaemonRequest::Wait(request));
+        tokio::pin!(request);
+        let started = tokio::time::Instant::now();
+        let progress_token = context.meta.get_progress_token();
+        let mut progress =
+            tokio::time::interval_at(started + WAIT_PROGRESS_INTERVAL, WAIT_PROGRESS_INTERVAL);
+        progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                biased;
+                () = context.ct.cancelled() => return Err(cancelled_result()),
+                response = &mut request => return response,
+                _ = progress.tick(), if progress_token.is_some() => {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let notification = ProgressNotificationParam::new(
+                        progress_token.clone().expect("guarded progress token"),
+                        elapsed,
+                    )
+                    .with_message("Waiting for monitored screen activity");
+                    let _ = context.peer.notify_progress(notification).await;
+                }
+            }
+        }
+    }
+
+    async fn finish_wait(
+        &self,
+        outcome: WaitOutcome,
+        baseline: FrameBinding,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match outcome.status {
+            WaitStatus::Timeout => {
+                if outcome.observation.is_some() || outcome.frame_id != baseline.internal_id {
+                    self.state.lock().await.clear_if_current(&baseline);
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "internal",
+                        "message": "daemon returned an invalid wait timeout",
+                    })));
+                }
+                let state = self.state.lock().await;
+                if let Err(error) = state.ensure_current(&baseline) {
+                    return Ok(structured_error(&error));
+                }
+                Ok(structured_result(McpWaitOutcome {
+                    status: WaitStatus::Timeout,
+                    elapsed_ms: outcome.elapsed_ms,
+                    frame: baseline.frame,
+                    activity_bbox: None,
+                    observation: None,
+                }))
+            }
+            WaitStatus::Changed => {
+                let Some(observation) = outcome.observation.as_ref() else {
+                    self.state.lock().await.clear_if_current(&baseline);
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "internal",
+                        "message": "changed wait result omitted its observation",
+                    })));
+                };
+                if outcome.frame_id != observation.frame_id || outcome.activity_bbox.is_none() {
+                    self.state.lock().await.clear_if_current(&baseline);
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "internal",
+                        "message": "daemon returned inconsistent changed wait metadata",
+                    })));
+                }
+
+                let mut state = self.state.lock().await;
+                let binding =
+                    match state.bind_wait_observation(&baseline, observation.frame_id.clone()) {
+                        Ok(binding) => binding,
+                        Err(error) => return Ok(structured_error(&error)),
+                    };
+                let projected = McpObservation::from_protocol(observation, binding.frame);
+                let result = image_result(
+                    McpWaitOutcome {
+                        status: WaitStatus::Changed,
+                        elapsed_ms: outcome.elapsed_ms,
+                        frame: binding.frame,
+                        activity_bbox: outcome.activity_bbox,
+                        observation: Some(projected),
+                    },
+                    observation.image_path.clone(),
+                )
+                .await?;
+                if context.ct.is_cancelled() || result.is_error == Some(true) {
+                    state.clear_if_current(&baseline);
+                    if context.ct.is_cancelled() {
+                        return Ok(cancelled_result());
+                    }
+                } else {
+                    state.commit(binding);
+                }
+                Ok(result)
+            }
         }
     }
 
@@ -662,7 +950,7 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
 
-        assert_eq!(names, ["computer_act", "computer_observe"]);
+        assert_eq!(names, ["computer_act", "computer_observe", "computer_wait"]);
     }
 
     #[test]
@@ -675,6 +963,7 @@ mod tests {
         let instructions = info.instructions.unwrap();
         for required in [
             "computer_observe",
+            "computer_wait",
             "latest returned frame number",
             "[0,width)",
             "stale_frame",
@@ -703,12 +992,13 @@ mod tests {
     }
 
     #[test]
-    fn publishes_described_bounded_input_and_structured_output_schemas() {
+    fn publishes_described_observe_and_action_schemas() {
         let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let observe = tool(&server, "computer_observe");
         let act = tool(&server, "computer_act");
+        let wait = tool(&server, "computer_wait");
 
-        let published = serde_json::to_string(&[&observe, &act]).unwrap();
+        let published = serde_json::to_string(&[&observe, &act, &wait]).unwrap();
         assert!(!published.contains("frame_id"));
         assert!(!published.contains("expected_frame_id"));
 
@@ -806,6 +1096,41 @@ mod tests {
     }
 
     #[test]
+    fn publishes_the_bounded_wait_schema_without_internal_frame_ids() {
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let wait = tool(&server, "computer_wait");
+        let wait_annotations = wait.annotations.unwrap();
+        assert_eq!(wait_annotations.read_only_hint, Some(true));
+        assert_eq!(wait_annotations.destructive_hint, Some(false));
+        assert_eq!(wait_annotations.idempotent_hint, Some(false));
+
+        let wait_schema = wait.input_schema;
+        assert_eq!(wait_schema["properties"]["frame"]["minimum"], 1);
+        assert_eq!(wait_schema["properties"]["include_rects"]["minItems"], 1);
+        assert_eq!(wait_schema["properties"]["include_rects"]["maxItems"], 8);
+        assert_eq!(wait_schema["properties"]["exclude_rects"]["maxItems"], 8);
+        assert_eq!(wait_schema["properties"]["timeout_ms"]["maximum"], 600_000);
+        assert_eq!(wait_schema["properties"]["coalesce_ms"]["default"], 2_000);
+        assert_eq!(wait_schema["properties"]["quiet_ms"]["default"], 1_000);
+        assert_eq!(
+            wait_schema["properties"]["settle_max_ms"]["default"],
+            15_000
+        );
+
+        let wait_output = wait.output_schema.unwrap();
+        assert_eq!(wait_output["properties"]["elapsed_ms"]["type"], "integer");
+        assert_eq!(wait_output["properties"]["frame"]["minimum"], 1);
+        assert!(wait_output["properties"].get("frame_id").is_none());
+        let wait_observation_properties = &wait_output["$defs"]["McpObservation"]["properties"];
+        for omitted in ["frame_id", "image_path", "target", "coordinate_space"] {
+            assert!(
+                wait_observation_properties.get(omitted).is_none(),
+                "wait output exposes {omitted}"
+            );
+        }
+    }
+
+    #[test]
     fn normal_action_result_contains_every_schema_required_field() {
         let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let act_output = tool(&server, "computer_act").output_schema.unwrap();
@@ -895,6 +1220,67 @@ mod tests {
             expected
         );
         assert!(result.content[1].as_image().is_some());
+    }
+
+    #[tokio::test]
+    async fn changed_wait_returns_compact_metadata_and_native_png() {
+        let directory = TempDir::new().unwrap();
+        let image_path = directory.path().join("wait.png");
+        tokio::fs::write(&image_path, [1, 2, 3]).await.unwrap();
+        let result = image_result(
+            McpWaitOutcome {
+                status: WaitStatus::Changed,
+                elapsed_ms: 32_784,
+                frame: 2,
+                activity_bbox: Some(Rect {
+                    x: 120,
+                    y: 240,
+                    width: 600,
+                    height: 310,
+                }),
+                observation: Some(McpObservation {
+                    frame: 2,
+                    width: 1_920,
+                    height: 1_080,
+                    settled: true,
+                }),
+            },
+            image_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "changed");
+        assert_eq!(structured["elapsed_ms"], 32_784);
+        assert_eq!(structured["frame"], 2);
+        assert_eq!(structured["observation"]["frame"], 2);
+        assert_eq!(result.content.len(), 2);
+        assert!(result.content[1].as_image().is_some());
+    }
+
+    #[test]
+    fn timed_out_wait_preserves_its_frame_without_an_image() {
+        let result = structured_result(McpWaitOutcome {
+            status: WaitStatus::Timeout,
+            elapsed_ms: 30_012,
+            frame: 7,
+            activity_bbox: None,
+            observation: None,
+        });
+
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "timeout");
+        assert_eq!(structured["frame"], 7);
+        assert!(structured.get("observation").is_none());
+        assert!(
+            result
+                .content
+                .iter()
+                .all(|content| content.as_image().is_none())
+        );
     }
 
     #[tokio::test]
@@ -1064,6 +1450,81 @@ mod tests {
 
         assert_eq!(second.frame, 2);
         assert_eq!(next.expected_frame_id, "internal-frame-2");
+    }
+
+    #[test]
+    fn wait_results_contain_every_schema_required_field() {
+        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let wait_output = tool(&server, "computer_wait").output_schema.unwrap();
+        let outcomes = [
+            McpWaitOutcome {
+                status: WaitStatus::Timeout,
+                elapsed_ms: 30_000,
+                frame: 1,
+                activity_bbox: None,
+                observation: None,
+            },
+            McpWaitOutcome {
+                status: WaitStatus::Changed,
+                elapsed_ms: 2_500,
+                frame: 2,
+                activity_bbox: Some(Rect {
+                    x: 10,
+                    y: 20,
+                    width: 30,
+                    height: 40,
+                }),
+                observation: Some(McpObservation {
+                    frame: 2,
+                    width: 100,
+                    height: 80,
+                    settled: true,
+                }),
+            },
+        ];
+
+        for outcome in outcomes {
+            let serialized = serde_json::to_value(outcome).unwrap();
+            for required in wait_output["required"].as_array().unwrap() {
+                let required = required.as_str().unwrap();
+                assert!(
+                    serialized.get(required).is_some(),
+                    "wait result omits schema-required field {required}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_wait_errors_do_not_invalidate_the_session_frame() {
+        assert!(!wait_error_invalidates_frame(ErrorCode::StaleFrame));
+        assert!(!wait_error_invalidates_frame(ErrorCode::InvalidAction));
+        assert!(wait_error_invalidates_frame(ErrorCode::ViewportChanged));
+        assert!(wait_error_invalidates_frame(ErrorCode::CaptureFailed));
+    }
+
+    #[test]
+    fn changed_wait_advances_the_frame_only_if_its_baseline_is_current() {
+        let mut state = McpSessionState::default();
+        let baseline = state
+            .bind_observation("internal-frame-1".to_owned())
+            .unwrap();
+        state.commit(baseline.clone());
+
+        let changed = state
+            .bind_wait_observation(&baseline, "internal-frame-2".to_owned())
+            .unwrap();
+        state.commit(changed.clone());
+
+        assert_eq!(changed.frame, 2);
+        assert_eq!(state.current, Some(changed));
+        assert_eq!(
+            state
+                .bind_wait_observation(&baseline, "internal-frame-3".to_owned())
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleFrame
+        );
     }
 
     #[test]

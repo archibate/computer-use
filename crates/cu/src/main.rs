@@ -18,8 +18,9 @@ use backend::{BackendChoice, BackendOptions};
 use clap::{Parser, Subcommand};
 use cu_core::{CaptureLimits, Engine, MIN_RETAINED_FRAMES};
 use cu_protocol::{
-    ActRequest, DaemonRequest, MAX_WAIT_POLL_MS, MAX_WAIT_TIMEOUT_MS, MIN_WAIT_POLL_MS,
-    ObserveRequest, Rect, RequestEnvelope, SettlePolicy, WaitRequest,
+    ActRequest, DEFAULT_WAIT_COALESCE_MS, DEFAULT_WAIT_QUIET_MS, DEFAULT_WAIT_SETTLE_MS,
+    DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest, MAX_WAIT_COALESCE_MS, MAX_WAIT_QUIET_MS,
+    MAX_WAIT_SETTLE_MS, MAX_WAIT_TIMEOUT_MS, ObserveRequest, Rect, RequestEnvelope, WaitRequest,
 };
 use uuid::Uuid;
 
@@ -159,24 +160,30 @@ enum Command {
         /// Latest opaque frame id, normally read from `cu status`.
         #[arg(long)]
         last_frame_id: String,
-        /// Watched rectangle as x,y,width,height; defaults to the whole frame.
-        #[arg(long, value_parser = parse_rect, value_name = "X,Y,W,H")]
-        rect: Option<Rect>,
+        /// Included rectangle as x,y,width,height; repeat for up to eight regions.
+        #[arg(
+            long = "include",
+            visible_alias = "rect",
+            required = true,
+            value_parser = parse_rect,
+            value_name = "X,Y,W,H"
+        )]
+        include_rects: Vec<Rect>,
         /// Ignored rectangle as x,y,width,height; may be repeated.
-        #[arg(long, value_parser = parse_rect, value_name = "X,Y,W,H")]
-        exclude: Vec<Rect>,
-        /// Maximum time to detect a change before returning changed=false.
-        #[arg(long, default_value_t = 30_000, value_parser = parse_wait_timeout)]
+        #[arg(long = "exclude", value_parser = parse_rect, value_name = "X,Y,W,H")]
+        exclude_rects: Vec<Rect>,
+        /// Maximum time to detect the first change.
+        #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_MS, value_parser = parse_wait_timeout)]
         timeout_ms: u64,
-        /// Delay after each unchanged capture.
-        #[arg(long, default_value_t = 500, value_parser = parse_wait_poll)]
-        poll_ms: u64,
-        /// Required unchanged interval after a detected change.
-        #[arg(long, default_value_t = 150)]
+        /// Minimum batching window after the first change.
+        #[arg(long, default_value_t = DEFAULT_WAIT_COALESCE_MS, value_parser = parse_wait_coalesce)]
+        coalesce_ms: u64,
+        /// Required continuous stability after monitored activity.
+        #[arg(long, default_value_t = DEFAULT_WAIT_QUIET_MS, value_parser = parse_wait_quiet)]
         quiet_ms: u64,
-        /// Maximum post-change settling grace.
-        #[arg(long, default_value_t = 1_500)]
-        settle_timeout_ms: u64,
+        /// Hard limit for coalescing and settling after the first change.
+        #[arg(long, default_value_t = DEFAULT_WAIT_SETTLE_MS, value_parser = parse_wait_settle)]
+        settle_max_ms: u64,
         /// Connect to this named instance; defaults to `default`.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
         instance: Option<InstanceName>,
@@ -200,7 +207,7 @@ enum Command {
         #[arg(long)]
         request_id: Option<String>,
     },
-    /// Serve `computer_observe` and `computer_act` over MCP stdio.
+    /// Serve `computer_observe`, `computer_wait`, and `computer_act` over MCP stdio.
     Mcp {
         /// Connect to this named instance; defaults to `default`.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
@@ -257,12 +264,12 @@ async fn main() -> Result<()> {
         }
         Command::Wait {
             last_frame_id,
-            rect,
-            exclude,
+            include_rects,
+            exclude_rects,
             timeout_ms,
-            poll_ms,
+            coalesce_ms,
             quiet_ms,
-            settle_timeout_ms,
+            settle_max_ms,
             instance,
             socket,
         } => {
@@ -271,14 +278,12 @@ async fn main() -> Result<()> {
                 socket,
                 DaemonRequest::Wait(WaitRequest {
                     last_frame_id,
-                    rect,
-                    exclude,
+                    include_rects,
+                    exclude_rects,
                     timeout_ms,
-                    poll_ms,
-                    settle: SettlePolicy {
-                        quiet_ms,
-                        timeout_ms: settle_timeout_ms,
-                    },
+                    coalesce_ms,
+                    quiet_ms,
+                    settle_max_ms,
                 }),
             )
             .await
@@ -422,8 +427,16 @@ fn parse_wait_timeout(value: &str) -> std::result::Result<u64, String> {
     parse_bounded_millis(value, 1, MAX_WAIT_TIMEOUT_MS, "timeout-ms")
 }
 
-fn parse_wait_poll(value: &str) -> std::result::Result<u64, String> {
-    parse_bounded_millis(value, MIN_WAIT_POLL_MS, MAX_WAIT_POLL_MS, "poll-ms")
+fn parse_wait_coalesce(value: &str) -> std::result::Result<u64, String> {
+    parse_bounded_millis(value, 0, MAX_WAIT_COALESCE_MS, "coalesce-ms")
+}
+
+fn parse_wait_quiet(value: &str) -> std::result::Result<u64, String> {
+    parse_bounded_millis(value, 1, MAX_WAIT_QUIET_MS, "quiet-ms")
+}
+
+fn parse_wait_settle(value: &str) -> std::result::Result<u64, String> {
+    parse_bounded_millis(value, 1, MAX_WAIT_SETTLE_MS, "settle-max-ms")
 }
 
 fn parse_bounded_millis(
@@ -716,24 +729,26 @@ mod tests {
             "wait",
             "--last-frame-id",
             "f_latest",
-            "--rect",
+            "--include",
             "10,20,300,400",
+            "--include",
+            "400,20,100,100",
             "--exclude",
             "20,30,4,5",
             "--exclude",
             "40,50,6,7",
             "--timeout-ms",
             "1000",
-            "--poll-ms",
-            "250",
+            "--coalesce-ms",
+            "300",
         ])
         .unwrap();
         let Command::Wait {
             last_frame_id,
-            rect,
-            exclude,
+            include_rects,
+            exclude_rects,
             timeout_ms,
-            poll_ms,
+            coalesce_ms,
             ..
         } = cli.command
         else {
@@ -741,17 +756,18 @@ mod tests {
         };
         assert_eq!(last_frame_id, "f_latest");
         assert_eq!(
-            rect,
-            Some(Rect {
+            include_rects[0],
+            Rect {
                 x: 10,
                 y: 20,
                 width: 300,
                 height: 400
-            })
+            }
         );
-        assert_eq!(exclude.len(), 2);
+        assert_eq!(include_rects.len(), 2);
+        assert_eq!(exclude_rects.len(), 2);
         assert_eq!(timeout_ms, 1_000);
-        assert_eq!(poll_ms, 250);
+        assert_eq!(coalesce_ms, 300);
     }
 
     #[test]
@@ -762,7 +778,7 @@ mod tests {
                 "wait",
                 "--last-frame-id",
                 "f_latest",
-                "--rect",
+                "--include",
                 "1,2,0,4"
             ])
             .is_err()
@@ -773,8 +789,10 @@ mod tests {
                 "wait",
                 "--last-frame-id",
                 "f_latest",
-                "--poll-ms",
-                "99"
+                "--include",
+                "1,2,3,4",
+                "--quiet-ms",
+                "0"
             ])
             .is_err()
         );
@@ -784,8 +802,10 @@ mod tests {
                 "wait",
                 "--last-frame-id",
                 "f_latest",
+                "--include",
+                "1,2,3,4",
                 "--timeout-ms",
-                "30001"
+                "600001"
             ])
             .is_err()
         );
