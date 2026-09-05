@@ -125,45 +125,36 @@ Coordinates are pixels in the returned, possibly downscaled frame. Supported
 actions are `move`, `click`, `double_click`, `drag`, `scroll`, `type`, and
 `keypress`. A batch contains at most 16 actions.
 
-To wait for screen activity without repeatedly capturing in an agent loop, read
-the current published baseline without taking another screenshot, then start a
-bounded wait:
+To wait for screen activity without repeatedly capturing in an agent loop,
+first observe and retain its `frame_id`, then start a bounded wait:
 
 ```sh
-frame_id=$(cu status | jq -er '.result.ok.result.frame_id')
-cu wait --last-frame-id "$frame_id" \
+cu wait --last-frame-id "<frame_id from cu observe>" \
   --include 780,120,800,720 \
   --include 40,120,700,720 \
   --exclude 1490,120,80,30 \
   --timeout-ms 600000 \
-  --coalesce-ms 30000 \
-  --quiet-ms 1000 \
-  --settle-max-ms 45000
+  --quiet-ms 30000
 ```
-
-If the daemon has not published a frame since startup, `cu status` returns
-`null`; run one observe first. After upgrading a running daemon, restart it
-before using the new status or wait protocol variants.
 
 Repeat `--include` for 1-8 regions and `--exclude` for up to 8 carets,
 animations, clocks, or other known noise. Comparison is exact RGB over the
 union of included rectangles minus the union of exclusions. Rectangles use
 baseline-frame `x,y,width,height` coordinates.
 
-The first change latches the wait. `coalesce_ms` is a minimum batching window
-from that change, while `quiet_ms` must pass without another monitored pixel
-change. Both are capped by `settle_max_ms`; reaching the cap publishes the
-latest frame with `settled:false`. The defaults are 2000 ms coalescing, 1000 ms
-quiet, and a 15000 ms settle cap. The daemon samples every 500 ms internally.
+`timeout_ms` is the total budget. After the first change, another monitored
+pixel change restarts `quiet_ms`. If the deadline arrives before a full quiet
+period, the latest changed frame is returned with `settled:false`. Defaults are
+30000 ms total and 2000 ms quiet. The daemon samples every 500 ms internally.
 
-An unchanged timeout returns `status:"timeout"`, `elapsed_ms`, and the same
-`frame_id`, without an image or frame-store publication. It can be re-armed
-against that baseline. Activity returns `status:"changed"`, the accumulated
-`activity_bbox`, and a fresh observation. A viewport-size change returns
+An unchanged timeout returns `status:"timeout"` and `elapsed_ms`, without an
+image or frame-store publication; re-arm it with the same baseline. Activity
+returns `status:"changed"`, the accumulated `activity_bbox`, and a fresh
+observation. A viewport-size change returns
 `viewport_changed` with expected and actual dimensions and requires another
 observe. Any concurrent observe, act, or changed wait supersedes the baseline
-and makes other waits stale. At most four waits run concurrently; excess
-requests return `busy`. Dropping the CLI process cancels its daemon wait.
+and makes the wait stale. One wait may run at a time; another returns `busy`.
+Dropping the CLI process cancels its daemon wait.
 
 ## MCP
 
@@ -174,7 +165,6 @@ Codex:
 
 ```sh
 codex mcp add cu -- cu mcp
-codex mcp add cu-x11-99 -- cu mcp --instance x11-99
 ```
 
 Claude Code (user scope, available across projects):
@@ -189,10 +179,10 @@ It exposes three tools:
   settling status, and a PNG image.
 - `computer_act` requires that latest `frame`, executes a validated batch, and
   returns execution metadata plus the next numbered observation and PNG.
-- `computer_wait` requires that latest `frame`, watches 1-8 included regions
-  minus optional exclusions, and blocks without repeated model polling. A
-  changed result returns the next numbered observation and native PNG; an
-  unchanged timeout returns no image and preserves the supplied frame.
+- `computer_wait` requires that latest `frame`, watches included regions
+  minus optional exclusions, and blocks without repeated model polling. It
+  returns a flat current `frame`; only a changed result includes a PNG and
+  `activity_bbox`.
 
 The published schemas describe every action, coordinate and key convention,
 settling limits, partial execution, and stale-frame recovery.
@@ -205,18 +195,19 @@ frame after a changed result. Call `computer_observe` after `stale_frame`,
 cancellation, or `viewport_changed`.
 
 `computer_wait` emits rate-limited progress notifications when the MCP client
-supplies a progress token and propagates request cancellation by dropping the
-daemon connection. Its worst-case duration is approximately `timeout_ms +
-settle_max_ms` plus capture and PNG encoding. Configure the MCP host's tool
-deadline above that bound. For example, a ten-minute Codex wait with a 45-second
-settle cap needs headroom such as:
+supplies a progress token and propagates cancellation by dropping the daemon
+connection. Its duration is `timeout_ms` plus terminal capture and PNG encoding.
+Configure the MCP host deadline above that bound. For example, this gives a
+ten-minute Codex wait generous headroom:
 
 ```toml
 [mcp_servers.cu]
 command = "cu"
 args = ["mcp"]
-tool_timeout_sec = 660
+tool_timeout_sec = 3600
 ```
+
+A full one-hour wait needs a deadline above 3600 seconds.
 
 Repeated changed results with unexpectedly small `elapsed_ms` indicate an
 active included region. Narrow the includes or exclude blinking cursors and

@@ -9,7 +9,7 @@ use std::{
 
 use cu_protocol::{
     CoordinateSpace, DaemonRequest, DaemonResponse, Observation, Rect, RequestEnvelope,
-    ResponseEnvelope, ResponseResult, WaitOutcome, WaitStatus,
+    ResponseEnvelope, ResponseResult, WaitOutcome,
 };
 
 #[test]
@@ -155,17 +155,13 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
         assert_eq!(wait.last_frame_id, "f_first");
         assert_eq!(wait.include_rects.len(), 1);
         assert_eq!(wait.exclude_rects.len(), 1);
-        assert_eq!(wait.coalesce_ms, 2_000);
+        assert_eq!(wait.quiet_ms, 2_000);
         write_daemon_response(
             timeout_stream,
             &ResponseEnvelope {
                 request_id: timed_out.request_id,
-                result: ResponseResult::Ok(DaemonResponse::Wait(WaitOutcome {
-                    status: WaitStatus::Timeout,
+                result: ResponseResult::Ok(DaemonResponse::Wait(WaitOutcome::Timeout {
                     elapsed_ms: 25,
-                    frame_id: "f_first".to_owned(),
-                    activity_bbox: None,
-                    observation: None,
                 })),
             },
         );
@@ -179,17 +175,15 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
             changed_stream,
             &ResponseEnvelope {
                 request_id: changed.request_id,
-                result: ResponseResult::Ok(DaemonResponse::Wait(WaitOutcome {
-                    status: WaitStatus::Changed,
+                result: ResponseResult::Ok(DaemonResponse::Wait(WaitOutcome::Changed {
                     elapsed_ms: 3_250,
-                    frame_id: "f_second".to_owned(),
-                    activity_bbox: Some(Rect {
+                    activity_bbox: Rect {
                         x: 10,
                         y: 20,
                         width: 30,
                         height: 40,
-                    }),
-                    observation: Some(observation("f_second", &second_image)),
+                    },
+                    observation: observation("f_second", &second_image),
                 })),
             },
         );
@@ -247,9 +241,11 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
     let changed = read_mcp_response(&mut stdout);
     assert_eq!(changed["result"]["structuredContent"]["status"], "changed");
     assert_eq!(changed["result"]["structuredContent"]["frame"], 2);
-    assert_eq!(
-        changed["result"]["structuredContent"]["observation"]["frame"],
-        2
+    assert_eq!(changed["result"]["structuredContent"]["settled"], true);
+    assert!(
+        changed["result"]["structuredContent"]
+            .get("observation")
+            .is_none()
     );
     assert_eq!(changed["result"]["content"].as_array().unwrap().len(), 2);
     assert_eq!(changed["result"]["content"][1]["type"], "image");

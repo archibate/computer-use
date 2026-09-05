@@ -77,7 +77,6 @@ impl WaylandBackend {
     }
 
     fn prepare_frame(&mut self, image: DynamicImage, output: &OutputInfo) -> CapturedFrame {
-        let original = image.dimensions();
         let image = fit_within(image, self.capture_limits);
         let (width, height) = image.dimensions();
         let logical_size = output.logical_size();
@@ -99,7 +98,6 @@ impl WaylandBackend {
             width,
             height,
             target: format!("output:{}", self.output_name),
-            resampled: original != (width, height),
         }
     }
 

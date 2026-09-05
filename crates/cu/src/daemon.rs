@@ -21,8 +21,6 @@ use tokio::{
     sync::Semaphore,
 };
 
-const MAX_CONCURRENT_WAITS: usize = 4;
-
 pub struct BoundSocket {
     listener: UnixListener,
     path: PathBuf,
@@ -63,7 +61,7 @@ pub async fn bind(socket: PathBuf) -> Result<BoundSocket> {
 
 pub async fn serve(bound: BoundSocket, engine: Engine) -> Result<()> {
     let engine = Arc::new(Mutex::new(engine));
-    let wait_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_WAITS));
+    let wait_slots = Arc::new(Semaphore::new(1));
     loop {
         let (stream, _) = bound
             .listener
@@ -168,7 +166,7 @@ async fn handle_wait(
                 request_id,
                 CuError::new(
                     ErrorCode::Busy,
-                    format!("at most {MAX_CONCURRENT_WAITS} screen-change waits may run"),
+                    "another screen-change wait is already active",
                 ),
             ),
         )
@@ -207,9 +205,10 @@ async fn run_wait(
     request: WaitRequest,
     cancelled: Arc<AtomicBool>,
 ) -> Result<WaitOutcome, CuError> {
+    let started_at = Instant::now();
     let begin_engine = Arc::clone(&engine);
     let mut tracker = tokio::task::spawn_blocking(move || {
-        lock_engine(&begin_engine)?.begin_wait(&request, Instant::now())
+        lock_engine(&begin_engine)?.begin_wait(&request, started_at)
     })
     .await
     .map_err(|error| join_error(&error))??;
@@ -360,7 +359,6 @@ mod tests {
             width: 100,
             height: 80,
             target: "mock:screen".to_owned(),
-            resampled: false,
         }
     }
 
@@ -375,9 +373,7 @@ mod tests {
             }],
             exclude_rects: Vec::new(),
             timeout_ms,
-            coalesce_ms: 100,
             quiet_ms: 100,
-            settle_max_ms: 300,
         }
     }
 
@@ -542,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires local Unix socket access"]
-    async fn fifth_concurrent_wait_returns_busy() {
+    async fn second_concurrent_wait_returns_busy() {
         let directory = TempDir::new().unwrap();
         let socket = directory.path().join("cu.sock");
         let engine = Engine::new(
@@ -557,18 +553,14 @@ mod tests {
         let bound = bind(socket.clone()).await.unwrap();
         let server = tokio::spawn(serve(bound, engine));
         let baseline = establish_baseline(&socket).await;
-        let mut held = Vec::new();
-        for index in 0..MAX_CONCURRENT_WAITS {
-            let mut stream = UnixStream::connect(&socket).await.unwrap();
-            let envelope = RequestEnvelope {
-                request_id: format!("held-wait-{index}"),
-                request: DaemonRequest::Wait(wait_request(baseline.frame_id.clone(), 10_000)),
-            };
-            let mut encoded = serde_json::to_vec(&envelope).unwrap();
-            encoded.push(b'\n');
-            stream.write_all(&encoded).await.unwrap();
-            held.push(stream);
-        }
+        let mut held = UnixStream::connect(&socket).await.unwrap();
+        let envelope = RequestEnvelope {
+            request_id: "held-wait".to_owned(),
+            request: DaemonRequest::Wait(wait_request(baseline.frame_id.clone(), 10_000)),
+        };
+        let mut encoded = serde_json::to_vec(&envelope).unwrap();
+        encoded.push(b'\n');
+        held.write_all(&encoded).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let response = tokio::time::timeout(

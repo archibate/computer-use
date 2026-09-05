@@ -7,10 +7,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cu_protocol::{
-    ActOutcome, ActRequest, ActStatus, Action, CuError, DEFAULT_WAIT_COALESCE_MS,
-    DEFAULT_WAIT_QUIET_MS, DEFAULT_WAIT_SETTLE_MS, DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest,
-    DaemonResponse, ErrorCode, Observation, ObserveRequest, Rect, RequestEnvelope,
-    ResponseEnvelope, ResponseResult, SettlePolicy, WaitOutcome, WaitRequest, WaitStatus,
+    ActOutcome, ActRequest, ActStatus, Action, CuError, DEFAULT_WAIT_QUIET_MS,
+    DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest, DaemonResponse, ErrorCode, Observation, ObserveRequest,
+    Rect, RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy, WaitOutcome,
+    WaitRequest,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::client;
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait pauses without repeated observation calls: an unchanged timeout returns no image and preserves its frame, while detected activity returns a fresh observation and PNG. Re-arm a timed-out wait with the same frame or a changed wait with its returned frame. Repeated waits with unexpectedly small elapsed_ms usually indicate that an included region contains irrelevant motion; narrow include_rects or exclude carets and animations. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait returns after watched pixels change and stay quiet, or when its timeout ends. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
 const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
@@ -63,38 +63,22 @@ struct McpWaitRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 8))]
     exclude_rects: Vec<Rect>,
-    /// Maximum time to detect the first change; defaults to 30000 ms.
+    /// Total budget for detection and post-change settling.
     #[serde(default = "default_wait_timeout_ms")]
-    #[schemars(range(min = 1, max = 600_000))]
+    #[schemars(range(min = 1, max = 3_600_000))]
     timeout_ms: u64,
-    /// Minimum batching window after the first change; defaults to 2000 ms.
-    #[serde(default = "default_wait_coalesce_ms")]
-    #[schemars(range(min = 0, max = 60_000))]
-    coalesce_ms: u64,
-    /// Required continuous stability after activity; defaults to 1000 ms.
+    /// Required continuous stability after activity.
     #[serde(default = "default_wait_quiet_ms")]
-    #[schemars(range(min = 1, max = 10_000))]
+    #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
-    /// Hard post-change limit; defaults to 15000 ms.
-    #[serde(default = "default_wait_settle_ms")]
-    #[schemars(range(min = 1, max = 120_000))]
-    settle_max_ms: u64,
 }
 
 const fn default_wait_timeout_ms() -> u64 {
     DEFAULT_WAIT_TIMEOUT_MS
 }
 
-const fn default_wait_coalesce_ms() -> u64 {
-    DEFAULT_WAIT_COALESCE_MS
-}
-
 const fn default_wait_quiet_ms() -> u64 {
     DEFAULT_WAIT_QUIET_MS
-}
-
-const fn default_wait_settle_ms() -> u64 {
-    DEFAULT_WAIT_SETTLE_MS
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -122,20 +106,26 @@ impl McpObservation {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum McpWaitStatus {
+    Changed,
+    Timeout,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 struct McpWaitOutcome {
     /// Whether monitored activity was observed or the unchanged timeout elapsed.
-    status: WaitStatus,
+    status: McpWaitStatus,
     /// Monotonic time through the terminal screen sample; excludes result encoding and transport.
     elapsed_ms: u64,
     /// Current session-local frame: unchanged on timeout and new after activity.
     #[schemars(range(min = 1))]
     frame: u64,
+    /// Whether the terminal frame satisfied `quiet_ms`; always true on an unchanged timeout.
+    settled: bool,
     /// Bounding box covering monitored activity since the first change.
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_bbox: Option<Rect>,
-    /// Fresh frame metadata after activity; absent on timeout.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observation: Option<McpObservation>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -375,6 +365,7 @@ fn wait_error_invalidates_frame(code: ErrorCode) -> bool {
     !matches!(
         code,
         ErrorCode::StaleFrame
+            | ErrorCode::Busy
             | ErrorCode::InvalidAction
             | ErrorCode::OutOfBounds
             | ErrorCode::UnsupportedInput
@@ -477,7 +468,7 @@ impl ComputerUseMcp {
     }
 
     #[tool(
-        description = "Wait for exact RGB pixel activity in the union of include_rects minus exclude_rects, relative to the supplied current frame. After the first change, coalesce activity and require a quiet interval, bounded by settle_max_ms. A changed result returns a fresh frame and PNG; an unchanged timeout returns no image and preserves the supplied frame. Repeated short waits suggest narrowing include_rects or excluding carets and animations.",
+        description = "Wait for an expected GUI change without polling. Returns after watched pixels changed or timeout, with a PNG on change. If changed results return repeatedly and quickly, narrow or exclude noisy regions.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<McpWaitOutcome>(),
         annotations(
             title = "Wait for computer change",
@@ -507,9 +498,7 @@ impl ComputerUseMcp {
             include_rects: request.include_rects,
             exclude_rects: request.exclude_rects,
             timeout_ms: request.timeout_ms,
-            coalesce_ms: request.coalesce_ms,
             quiet_ms: request.quiet_ms,
-            settle_max_ms: request.settle_max_ms,
         };
         let response = match self.request_wait_daemon(protocol_request, &context).await {
             Ok(response) => response,
@@ -711,59 +700,40 @@ impl ComputerUseMcp {
         baseline: FrameBinding,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        match outcome.status {
-            WaitStatus::Timeout => {
-                if outcome.observation.is_some() || outcome.frame_id != baseline.internal_id {
-                    self.state.lock().await.clear_if_current(&baseline);
-                    return Ok(CallToolResult::structured_error(json!({
-                        "code": "internal",
-                        "message": "daemon returned an invalid wait timeout",
-                    })));
-                }
+        match outcome {
+            WaitOutcome::Timeout { elapsed_ms } => {
                 let state = self.state.lock().await;
                 if let Err(error) = state.ensure_current(&baseline) {
                     return Ok(structured_error(&error));
                 }
                 Ok(structured_result(McpWaitOutcome {
-                    status: WaitStatus::Timeout,
-                    elapsed_ms: outcome.elapsed_ms,
+                    status: McpWaitStatus::Timeout,
+                    elapsed_ms,
                     frame: baseline.frame,
+                    settled: true,
                     activity_bbox: None,
-                    observation: None,
                 }))
             }
-            WaitStatus::Changed => {
-                let Some(observation) = outcome.observation.as_ref() else {
-                    self.state.lock().await.clear_if_current(&baseline);
-                    return Ok(CallToolResult::structured_error(json!({
-                        "code": "internal",
-                        "message": "changed wait result omitted its observation",
-                    })));
-                };
-                if outcome.frame_id != observation.frame_id || outcome.activity_bbox.is_none() {
-                    self.state.lock().await.clear_if_current(&baseline);
-                    return Ok(CallToolResult::structured_error(json!({
-                        "code": "internal",
-                        "message": "daemon returned inconsistent changed wait metadata",
-                    })));
-                }
-
+            WaitOutcome::Changed {
+                elapsed_ms,
+                activity_bbox,
+                observation,
+            } => {
                 let mut state = self.state.lock().await;
                 let binding =
                     match state.bind_wait_observation(&baseline, observation.frame_id.clone()) {
                         Ok(binding) => binding,
                         Err(error) => return Ok(structured_error(&error)),
                     };
-                let projected = McpObservation::from_protocol(observation, binding.frame);
                 let result = image_result(
                     McpWaitOutcome {
-                        status: WaitStatus::Changed,
-                        elapsed_ms: outcome.elapsed_ms,
+                        status: McpWaitStatus::Changed,
+                        elapsed_ms,
                         frame: binding.frame,
-                        activity_bbox: outcome.activity_bbox,
-                        observation: Some(projected),
+                        settled: observation.settled,
+                        activity_bbox: Some(activity_bbox),
                     },
-                    observation.image_path.clone(),
+                    observation.image_path,
                 )
                 .await?;
                 if context.ct.is_cancelled() || result.is_error == Some(true) {
@@ -1109,24 +1079,21 @@ mod tests {
         assert_eq!(wait_schema["properties"]["include_rects"]["minItems"], 1);
         assert_eq!(wait_schema["properties"]["include_rects"]["maxItems"], 8);
         assert_eq!(wait_schema["properties"]["exclude_rects"]["maxItems"], 8);
-        assert_eq!(wait_schema["properties"]["timeout_ms"]["maximum"], 600_000);
-        assert_eq!(wait_schema["properties"]["coalesce_ms"]["default"], 2_000);
-        assert_eq!(wait_schema["properties"]["quiet_ms"]["default"], 1_000);
         assert_eq!(
-            wait_schema["properties"]["settle_max_ms"]["default"],
-            15_000
+            wait_schema["properties"]["timeout_ms"]["maximum"],
+            3_600_000
         );
+        assert!(wait_schema["properties"].get("coalesce_ms").is_none());
+        assert_eq!(wait_schema["properties"]["quiet_ms"]["default"], 2_000);
+        assert_eq!(wait_schema["properties"]["quiet_ms"]["maximum"], 60_000);
+        assert!(wait_schema["properties"].get("settle_max_ms").is_none());
 
         let wait_output = wait.output_schema.unwrap();
         assert_eq!(wait_output["properties"]["elapsed_ms"]["type"], "integer");
         assert_eq!(wait_output["properties"]["frame"]["minimum"], 1);
         assert!(wait_output["properties"].get("frame_id").is_none());
-        let wait_observation_properties = &wait_output["$defs"]["McpObservation"]["properties"];
-        for omitted in ["frame_id", "image_path", "target", "coordinate_space"] {
-            assert!(
-                wait_observation_properties.get(omitted).is_none(),
-                "wait output exposes {omitted}"
-            );
+        for omitted in ["observation", "width", "height", "image_path", "target"] {
+            assert!(wait_output["properties"].get(omitted).is_none());
         }
     }
 
@@ -1229,20 +1196,15 @@ mod tests {
         tokio::fs::write(&image_path, [1, 2, 3]).await.unwrap();
         let result = image_result(
             McpWaitOutcome {
-                status: WaitStatus::Changed,
+                status: McpWaitStatus::Changed,
                 elapsed_ms: 32_784,
                 frame: 2,
+                settled: true,
                 activity_bbox: Some(Rect {
                     x: 120,
                     y: 240,
                     width: 600,
                     height: 310,
-                }),
-                observation: Some(McpObservation {
-                    frame: 2,
-                    width: 1_920,
-                    height: 1_080,
-                    settled: true,
                 }),
             },
             image_path.to_string_lossy().into_owned(),
@@ -1255,7 +1217,8 @@ mod tests {
         assert_eq!(structured["status"], "changed");
         assert_eq!(structured["elapsed_ms"], 32_784);
         assert_eq!(structured["frame"], 2);
-        assert_eq!(structured["observation"]["frame"], 2);
+        assert_eq!(structured["settled"], true);
+        assert!(structured.get("observation").is_none());
         assert_eq!(result.content.len(), 2);
         assert!(result.content[1].as_image().is_some());
     }
@@ -1263,11 +1226,11 @@ mod tests {
     #[test]
     fn timed_out_wait_preserves_its_frame_without_an_image() {
         let result = structured_result(McpWaitOutcome {
-            status: WaitStatus::Timeout,
+            status: McpWaitStatus::Timeout,
             elapsed_ms: 30_012,
             frame: 7,
+            settled: true,
             activity_bbox: None,
-            observation: None,
         });
 
         assert_eq!(result.is_error, Some(false));
@@ -1458,27 +1421,22 @@ mod tests {
         let wait_output = tool(&server, "computer_wait").output_schema.unwrap();
         let outcomes = [
             McpWaitOutcome {
-                status: WaitStatus::Timeout,
+                status: McpWaitStatus::Timeout,
                 elapsed_ms: 30_000,
                 frame: 1,
+                settled: true,
                 activity_bbox: None,
-                observation: None,
             },
             McpWaitOutcome {
-                status: WaitStatus::Changed,
+                status: McpWaitStatus::Changed,
                 elapsed_ms: 2_500,
                 frame: 2,
+                settled: false,
                 activity_bbox: Some(Rect {
                     x: 10,
                     y: 20,
                     width: 30,
                     height: 40,
-                }),
-                observation: Some(McpObservation {
-                    frame: 2,
-                    width: 100,
-                    height: 80,
-                    settled: true,
                 }),
             },
         ];
@@ -1498,6 +1456,7 @@ mod tests {
     #[test]
     fn stale_wait_errors_do_not_invalidate_the_session_frame() {
         assert!(!wait_error_invalidates_frame(ErrorCode::StaleFrame));
+        assert!(!wait_error_invalidates_frame(ErrorCode::Busy));
         assert!(!wait_error_invalidates_frame(ErrorCode::InvalidAction));
         assert!(wait_error_invalidates_frame(ErrorCode::ViewportChanged));
         assert!(wait_error_invalidates_frame(ErrorCode::CaptureFailed));

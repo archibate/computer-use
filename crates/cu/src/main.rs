@@ -18,9 +18,8 @@ use backend::{BackendChoice, BackendOptions};
 use clap::{Parser, Subcommand};
 use cu_core::{CaptureLimits, Engine, MIN_RETAINED_FRAMES};
 use cu_protocol::{
-    ActRequest, DEFAULT_WAIT_COALESCE_MS, DEFAULT_WAIT_QUIET_MS, DEFAULT_WAIT_SETTLE_MS,
-    DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest, MAX_WAIT_COALESCE_MS, MAX_WAIT_QUIET_MS,
-    MAX_WAIT_SETTLE_MS, MAX_WAIT_TIMEOUT_MS, ObserveRequest, Rect, RequestEnvelope, WaitRequest,
+    ActRequest, DEFAULT_WAIT_QUIET_MS, DEFAULT_WAIT_TIMEOUT_MS, DaemonRequest, MAX_WAIT_QUIET_MS,
+    MAX_WAIT_TIMEOUT_MS, ObserveRequest, Rect, RequestEnvelope, WaitRequest,
 };
 use uuid::Uuid;
 
@@ -146,24 +145,14 @@ enum Command {
         #[arg(long, conflicts_with = "instance")]
         socket: Option<PathBuf>,
     },
-    /// Print the latest published frame metadata without capturing.
-    Status {
-        /// Connect to this named instance; defaults to `default`.
-        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
-        instance: Option<InstanceName>,
-        /// Connect to this raw socket instead of a named instance.
-        #[arg(long, conflicts_with = "instance")]
-        socket: Option<PathBuf>,
-    },
     /// Wait for exact pixel changes relative to a published frame.
     Wait {
-        /// Latest opaque frame id, normally read from `cu status`.
+        /// Latest opaque frame id returned by `cu observe` or a changed wait.
         #[arg(long)]
         last_frame_id: String,
         /// Included rectangle as x,y,width,height; repeat for up to eight regions.
         #[arg(
             long = "include",
-            visible_alias = "rect",
             required = true,
             value_parser = parse_rect,
             value_name = "X,Y,W,H"
@@ -172,18 +161,12 @@ enum Command {
         /// Ignored rectangle as x,y,width,height; may be repeated.
         #[arg(long = "exclude", value_parser = parse_rect, value_name = "X,Y,W,H")]
         exclude_rects: Vec<Rect>,
-        /// Maximum time to detect the first change.
+        /// Total time budget for detection and post-change settling.
         #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_MS, value_parser = parse_wait_timeout)]
         timeout_ms: u64,
-        /// Minimum batching window after the first change.
-        #[arg(long, default_value_t = DEFAULT_WAIT_COALESCE_MS, value_parser = parse_wait_coalesce)]
-        coalesce_ms: u64,
         /// Required continuous stability after monitored activity.
         #[arg(long, default_value_t = DEFAULT_WAIT_QUIET_MS, value_parser = parse_wait_quiet)]
         quiet_ms: u64,
-        /// Hard limit for coalescing and settling after the first change.
-        #[arg(long, default_value_t = DEFAULT_WAIT_SETTLE_MS, value_parser = parse_wait_settle)]
-        settle_max_ms: u64,
         /// Connect to this named instance; defaults to `default`.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
         instance: Option<InstanceName>,
@@ -259,17 +242,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Status { instance, socket } => {
-            print_fresh_response(instance, socket, DaemonRequest::Status).await
-        }
         Command::Wait {
             last_frame_id,
             include_rects,
             exclude_rects,
             timeout_ms,
-            coalesce_ms,
             quiet_ms,
-            settle_max_ms,
             instance,
             socket,
         } => {
@@ -281,9 +259,7 @@ async fn main() -> Result<()> {
                     include_rects,
                     exclude_rects,
                     timeout_ms,
-                    coalesce_ms,
                     quiet_ms,
-                    settle_max_ms,
                 }),
             )
             .await
@@ -427,16 +403,8 @@ fn parse_wait_timeout(value: &str) -> std::result::Result<u64, String> {
     parse_bounded_millis(value, 1, MAX_WAIT_TIMEOUT_MS, "timeout-ms")
 }
 
-fn parse_wait_coalesce(value: &str) -> std::result::Result<u64, String> {
-    parse_bounded_millis(value, 0, MAX_WAIT_COALESCE_MS, "coalesce-ms")
-}
-
 fn parse_wait_quiet(value: &str) -> std::result::Result<u64, String> {
     parse_bounded_millis(value, 1, MAX_WAIT_QUIET_MS, "quiet-ms")
-}
-
-fn parse_wait_settle(value: &str) -> std::result::Result<u64, String> {
-    parse_bounded_millis(value, 1, MAX_WAIT_SETTLE_MS, "settle-max-ms")
 }
 
 fn parse_bounded_millis(
@@ -739,7 +707,7 @@ mod tests {
             "40,50,6,7",
             "--timeout-ms",
             "1000",
-            "--coalesce-ms",
+            "--quiet-ms",
             "300",
         ])
         .unwrap();
@@ -748,7 +716,7 @@ mod tests {
             include_rects,
             exclude_rects,
             timeout_ms,
-            coalesce_ms,
+            quiet_ms,
             ..
         } = cli.command
         else {
@@ -767,7 +735,7 @@ mod tests {
         assert_eq!(include_rects.len(), 2);
         assert_eq!(exclude_rects.len(), 2);
         assert_eq!(timeout_ms, 1_000);
-        assert_eq!(coalesce_ms, 300);
+        assert_eq!(quiet_ms, 300);
     }
 
     #[test]
@@ -805,7 +773,7 @@ mod tests {
                 "--include",
                 "1,2,3,4",
                 "--timeout-ms",
-                "600001"
+                "3600001"
             ])
             .is_err()
         );

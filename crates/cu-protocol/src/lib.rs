@@ -10,14 +10,10 @@ pub const MAX_DRAG_POINTS: usize = 256;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_INCLUDE_RECTS: usize = 8;
 pub const MAX_EXCLUDE_RECTS: usize = 8;
-pub const MAX_WAIT_TIMEOUT_MS: u64 = 600_000;
-pub const MAX_WAIT_COALESCE_MS: u64 = 60_000;
-pub const MAX_WAIT_QUIET_MS: u64 = 10_000;
-pub const MAX_WAIT_SETTLE_MS: u64 = 120_000;
+pub const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_WAIT_QUIET_MS: u64 = 60_000;
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
-pub const DEFAULT_WAIT_COALESCE_MS: u64 = 2_000;
-pub const DEFAULT_WAIT_QUIET_MS: u64 = 1_000;
-pub const DEFAULT_WAIT_SETTLE_MS: u64 = 15_000;
+pub const DEFAULT_WAIT_QUIET_MS: u64 = 2_000;
 
 /// Mouse button used by a click action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -212,83 +208,48 @@ pub struct WaitRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 8))]
     pub exclude_rects: Vec<Rect>,
-    /// Maximum time to detect the first change, from 1 ms through 10 minutes.
+    /// Total wait budget, from 1 ms through 1 hour.
     #[serde(default = "default_wait_timeout_ms")]
-    #[schemars(range(min = 1, max = 600_000))]
+    #[schemars(range(min = 1, max = 3_600_000))]
     pub timeout_ms: u64,
-    /// Minimum batching window after the first change, from 0 through 60000 ms.
-    #[serde(default = "default_wait_coalesce_ms")]
-    #[schemars(range(min = 0, max = 60_000))]
-    pub coalesce_ms: u64,
-    /// Required continuous stability after activity, from 1 through 10000 ms.
+    /// Required continuous stability after activity, from 1 through 60000 ms.
     #[serde(default = "default_wait_quiet_ms")]
-    #[schemars(range(min = 1, max = 10_000))]
+    #[schemars(range(min = 1, max = 60_000))]
     pub quiet_ms: u64,
-    /// Hard post-change limit, from 1 through 120000 ms.
-    #[serde(default = "default_wait_settle_ms")]
-    #[schemars(range(min = 1, max = 120_000))]
-    pub settle_max_ms: u64,
 }
 
 const fn default_wait_timeout_ms() -> u64 {
     DEFAULT_WAIT_TIMEOUT_MS
 }
 
-const fn default_wait_coalesce_ms() -> u64 {
-    DEFAULT_WAIT_COALESCE_MS
-}
-
 const fn default_wait_quiet_ms() -> u64 {
     DEFAULT_WAIT_QUIET_MS
 }
 
-const fn default_wait_settle_ms() -> u64 {
-    DEFAULT_WAIT_SETTLE_MS
-}
-
-/// Metadata for the latest published frame, returned without capturing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct FrameStatus {
-    /// Opaque frame identifier accepted by `cu wait --last-frame-id`.
-    pub frame_id: String,
-    /// Baseline width in frame pixels.
-    pub width: u32,
-    /// Baseline height in frame pixels.
-    pub height: u32,
-}
-
-/// Terminal state of one bounded screen-change wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitStatus {
-    /// Watched pixels changed and a fresh observation was published.
-    Changed,
-    /// No watched pixel changed before the detection timeout.
-    Timeout,
-}
-
 /// Result of one bounded screen-change wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct WaitOutcome {
-    /// Whether the wait observed activity or reached its unchanged timeout.
-    pub status: WaitStatus,
-    /// Monotonic time through the terminal screen sample; excludes result encoding and transport.
-    pub elapsed_ms: u64,
-    /// Current opaque frame id: the baseline on timeout, or the fresh result after change.
-    pub frame_id: String,
-    /// Bounding box covering monitored pixel activity since the first change.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activity_bbox: Option<Rect>,
-    /// Fresh changed frame; absent on an unchanged timeout.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observation: Option<Observation>,
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WaitOutcome {
+    /// No monitored pixel changed before the total wait budget expired.
+    Timeout {
+        /// Monotonic time through the terminal screen sample.
+        elapsed_ms: u64,
+    },
+    /// Monitored activity produced a fresh observation.
+    Changed {
+        /// Monotonic time through the terminal screen sample.
+        elapsed_ms: u64,
+        /// Bounding box covering monitored activity since the first change.
+        activity_bbox: Rect,
+        /// Fresh frame returned alongside its PNG.
+        observation: Observation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Profile,
-    Status,
     Observe(ObserveRequest),
     Act(ActRequest),
     Wait(WaitRequest),
@@ -385,7 +346,6 @@ const fn is_false(value: &bool) -> bool {
 #[serde(tag = "operation", content = "result", rename_all = "snake_case")]
 pub enum DaemonResponse {
     Profile(Option<String>),
-    Status(Option<FrameStatus>),
     Observe(Observation),
     Act(ActOutcome),
     Wait(WaitOutcome),
@@ -535,8 +495,8 @@ pub fn validate_act_request(request: &ActRequest, viewport: Viewport) -> Result<
 ///
 /// # Errors
 ///
-/// Returns [`CuError`] when the frame id, timing, rectangle bounds, rectangle
-/// counts, or remaining watched area is invalid.
+/// Returns [`CuError`] when the frame id, timing, rectangle bounds, or rectangle
+/// counts are invalid.
 pub fn validate_wait_request(request: &WaitRequest, viewport: Viewport) -> Result<(), CuError> {
     if request.last_frame_id.is_empty() {
         return Err(CuError::new(
@@ -550,28 +510,10 @@ pub fn validate_wait_request(request: &WaitRequest, viewport: Viewport) -> Resul
             format!("timeout_ms must be between 1 and {MAX_WAIT_TIMEOUT_MS}"),
         ));
     }
-    if request.coalesce_ms > MAX_WAIT_COALESCE_MS {
-        return Err(CuError::new(
-            ErrorCode::InvalidAction,
-            format!("coalesce_ms must be no more than {MAX_WAIT_COALESCE_MS}"),
-        ));
-    }
     if request.quiet_ms == 0 || request.quiet_ms > MAX_WAIT_QUIET_MS {
         return Err(CuError::new(
             ErrorCode::InvalidAction,
             format!("quiet_ms must be between 1 and {MAX_WAIT_QUIET_MS}"),
-        ));
-    }
-    if request.settle_max_ms == 0 || request.settle_max_ms > MAX_WAIT_SETTLE_MS {
-        return Err(CuError::new(
-            ErrorCode::InvalidAction,
-            format!("settle_max_ms must be between 1 and {MAX_WAIT_SETTLE_MS}"),
-        ));
-    }
-    if request.settle_max_ms < request.coalesce_ms.max(request.quiet_ms) {
-        return Err(CuError::new(
-            ErrorCode::InvalidAction,
-            "settle_max_ms must be at least coalesce_ms and quiet_ms",
         ));
     }
     if request.include_rects.is_empty() || request.include_rects.len() > MAX_INCLUDE_RECTS {
@@ -593,16 +535,6 @@ pub fn validate_wait_request(request: &WaitRequest, viewport: Viewport) -> Resul
     for excluded in &request.exclude_rects {
         validate_rect(*excluded, viewport, "exclude rectangle")?;
     }
-    if request
-        .include_rects
-        .iter()
-        .all(|included| rect_is_fully_covered(*included, &request.exclude_rects))
-    {
-        return Err(CuError::new(
-            ErrorCode::InvalidAction,
-            "exclude_rects cover the entire included region",
-        ));
-    }
     Ok(())
 }
 
@@ -623,47 +555,6 @@ fn validate_rect(rect: Rect, viewport: Viewport, name: &str) -> Result<(), CuErr
         ));
     }
     Ok(())
-}
-
-fn rect_is_fully_covered(watched: Rect, excluded: &[Rect]) -> bool {
-    let watched_right = watched.x + watched.width;
-    let watched_bottom = watched.y + watched.height;
-    let mut y_edges = vec![watched.y, watched_bottom];
-    for rect in excluded {
-        let top = rect.y.max(watched.y);
-        let bottom = (rect.y + rect.height).min(watched_bottom);
-        if top < bottom {
-            y_edges.push(top);
-            y_edges.push(bottom);
-        }
-    }
-    y_edges.sort_unstable();
-    y_edges.dedup();
-
-    y_edges.windows(2).all(|band| {
-        let y = band[0];
-        let mut intervals = excluded
-            .iter()
-            .filter(|rect| y >= rect.y && y < rect.y + rect.height)
-            .filter_map(|rect| {
-                let left = rect.x.max(watched.x);
-                let right = (rect.x + rect.width).min(watched_right);
-                (left < right).then_some((left, right))
-            })
-            .collect::<Vec<_>>();
-        intervals.sort_unstable();
-        let mut covered_until = watched.x;
-        for (left, right) in intervals {
-            if left > covered_until {
-                return false;
-            }
-            covered_until = covered_until.max(right);
-            if covered_until >= watched_right {
-                return true;
-            }
-        }
-        false
-    })
 }
 
 /// Validate the quiet period and overall timeout used for visual settling.
@@ -859,17 +750,9 @@ mod tests {
                 height: 3,
             }],
             timeout_ms: 1_000,
-            coalesce_ms: 200,
             quiet_ms: 100,
-            settle_max_ms: 500,
         });
-        let response = DaemonResponse::Wait(WaitOutcome {
-            status: WaitStatus::Timeout,
-            elapsed_ms: 1_000,
-            frame_id: "f_latest".to_owned(),
-            activity_bbox: None,
-            observation: None,
-        });
+        let response = DaemonResponse::Wait(WaitOutcome::Timeout { elapsed_ms: 1_000 });
 
         let encoded_request = serde_json::to_value(request).unwrap();
         assert_eq!(encoded_request["operation"], "wait");
@@ -882,15 +765,14 @@ mod tests {
                 "operation": "wait",
                 "result": {
                     "status": "timeout",
-                    "elapsed_ms": 1000,
-                    "frame_id": "f_latest"
+                    "elapsed_ms": 1000
                 }
             })
         );
     }
 
     #[test]
-    fn validates_wait_bounds_timing_and_nonempty_mask() {
+    fn validates_wait_bounds_and_timing() {
         let viewport = Viewport {
             width: 100,
             height: 80,
@@ -905,9 +787,7 @@ mod tests {
             }],
             exclude_rects: Vec::new(),
             timeout_ms: 1_000,
-            coalesce_ms: 200,
             quiet_ms: 100,
-            settle_max_ms: 500,
         };
         assert!(validate_wait_request(&request, viewport).is_ok());
 
@@ -917,12 +797,12 @@ mod tests {
             ErrorCode::InvalidAction
         );
         request.quiet_ms = 100;
-        request.settle_max_ms = 199;
+        request.timeout_ms = MAX_WAIT_TIMEOUT_MS + 1;
         assert_eq!(
             validate_wait_request(&request, viewport).unwrap_err().code,
             ErrorCode::InvalidAction
         );
-        request.settle_max_ms = 500;
+        request.timeout_ms = 1_000;
         request.include_rects = vec![Rect {
             x: 90,
             y: 10,
@@ -939,20 +819,6 @@ mod tests {
             width: 20,
             height: 20,
         }];
-        request.exclude_rects = vec![Rect {
-            x: 10,
-            y: 10,
-            width: 20,
-            height: 20,
-        }];
-        assert!(
-            validate_wait_request(&request, viewport)
-                .unwrap_err()
-                .message
-                .contains("entire included region")
-        );
-
-        request.exclude_rects.clear();
         request.include_rects = vec![request.include_rects[0]; MAX_INCLUDE_RECTS + 1];
         assert_eq!(
             validate_wait_request(&request, viewport).unwrap_err().code,

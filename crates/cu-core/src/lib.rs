@@ -15,9 +15,8 @@ use std::{
 
 use cu_protocol::{
     ActOutcome, ActStatus, CoordinateSpace, CuError, DaemonRequest, DaemonResponse, ErrorCode,
-    FrameStatus, Observation, Rect, RequestEnvelope, ResponseEnvelope, ResponseResult,
-    SettlePolicy, Viewport, WaitOutcome, WaitRequest, WaitStatus, validate_act_request,
-    validate_settle_policy, validate_wait_request,
+    Observation, Rect, RequestEnvelope, ResponseEnvelope, ResponseResult, SettlePolicy, Viewport,
+    WaitOutcome, WaitRequest, validate_act_request, validate_settle_policy, validate_wait_request,
 };
 use image::{ImageFormat, RgbImage};
 use uuid::Uuid;
@@ -169,8 +168,6 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub target: String,
-    /// Whether this frame was resampled from a different native size.
-    pub resampled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -269,12 +266,9 @@ pub struct WaitTracker {
     baseline: CapturedFrame,
     mask: WatchMask,
     started_at: Instant,
-    detection_deadline: Instant,
+    deadline: Instant,
     poll_interval: Duration,
-    coalesce: Duration,
     quiet: Duration,
-    settle_max: Duration,
-    activity_bbox: Option<Rect>,
     phase: WaitPhase,
 }
 
@@ -283,8 +277,7 @@ enum WaitPhase {
     Settling {
         previous: CapturedFrame,
         unchanged_since: Instant,
-        first_change_at: Instant,
-        deadline: Instant,
+        activity_bbox: Rect,
     },
 }
 
@@ -357,15 +350,6 @@ impl Engine {
         self.latest.as_ref().map(|latest| &latest.observation)
     }
 
-    #[must_use]
-    pub fn status(&self) -> Option<FrameStatus> {
-        self.latest().map(|observation| FrameStatus {
-            frame_id: observation.frame_id.clone(),
-            width: observation.width,
-            height: observation.height,
-        })
-    }
-
     pub fn handle(&mut self, envelope: RequestEnvelope) -> ResponseEnvelope {
         if let Some(cached) = self.completed_actions.get(&envelope.request_id) {
             if cached.request == envelope.request {
@@ -394,10 +378,6 @@ impl Engine {
             DaemonRequest::Profile => response_from_result(
                 envelope.request_id.clone(),
                 Ok(DaemonResponse::Profile(self.profile.clone())),
-            ),
-            DaemonRequest::Status => response_from_result(
-                envelope.request_id.clone(),
-                Ok(DaemonResponse::Status(self.status())),
             ),
             DaemonRequest::Observe(request) => {
                 let result = validate_settle_policy(request.settle)
@@ -453,12 +433,9 @@ impl Engine {
             baseline: latest.frame.clone(),
             mask,
             started_at: now,
-            detection_deadline: now + Duration::from_millis(request.timeout_ms),
+            deadline: now + Duration::from_millis(request.timeout_ms),
             poll_interval: Duration::from_millis(WAIT_POLL_INTERVAL_MS),
-            coalesce: Duration::from_millis(request.coalesce_ms),
             quiet: Duration::from_millis(request.quiet_ms),
-            settle_max: Duration::from_millis(request.settle_max_ms),
-            activity_bbox: None,
             phase: WaitPhase::Watching,
         })
     }
@@ -513,11 +490,6 @@ impl Engine {
         ensure_latest(&tracker.baseline_id, &latest.frame_id)?;
         validate_captured_frame(&frame)?;
         let png = encode_png(&frame)?;
-
-        let latest = self.latest().ok_or_else(|| {
-            CuError::new(ErrorCode::StaleFrame, "the wait baseline is unavailable")
-        })?;
-        ensure_latest(&tracker.baseline_id, &latest.frame_id)?;
         if cancelled.load(Ordering::Acquire) {
             return Err(cancelled_error());
         }
@@ -529,12 +501,10 @@ impl Engine {
                 observation.frame_id
             );
         }
-        Ok(WaitOutcome {
-            status: WaitStatus::Changed,
+        Ok(WaitOutcome::Changed {
             elapsed_ms,
-            frame_id: observation.frame_id.clone(),
-            activity_bbox: Some(activity_bbox),
-            observation: Some(observation),
+            activity_bbox,
+            observation,
         })
     }
 
@@ -702,24 +672,14 @@ impl Engine {
 impl WaitTracker {
     #[must_use]
     pub fn next_delay(&self, now: Instant) -> Duration {
-        match &self.phase {
-            WaitPhase::Watching => self
-                .poll_interval
-                .min(self.detection_deadline.saturating_duration_since(now)),
-            WaitPhase::Settling { deadline, .. } => self
-                .poll_interval
-                .min(deadline.saturating_duration_since(now)),
-        }
+        self.poll_interval
+            .min(self.deadline.saturating_duration_since(now))
     }
 
     #[must_use]
-    pub fn timed_out_outcome(&self, now: Instant) -> WaitOutcome {
-        WaitOutcome {
-            status: WaitStatus::Timeout,
+    fn timed_out_outcome(&self, now: Instant) -> WaitOutcome {
+        WaitOutcome::Timeout {
             elapsed_ms: elapsed_millis(self.started_at, now),
-            frame_id: self.baseline_id.clone(),
-            activity_bbox: None,
-            observation: None,
         }
     }
 
@@ -735,60 +695,57 @@ impl WaitTracker {
     ) -> Result<WaitStep, CuError> {
         ensure_wait_viewport(&self.baseline, &frame)?;
         let elapsed_ms = elapsed_millis(self.started_at, now);
+        let deadline = self.deadline;
         match &mut self.phase {
             WaitPhase::Watching => {
-                let difference = compare_masked(&self.baseline, &frame, &self.mask);
-                if difference.changed_pixels == 0 {
-                    return if now >= self.detection_deadline {
+                let Some(activity_bbox) = compare_masked(&self.baseline, &frame, &self.mask) else {
+                    return if now >= deadline {
                         Ok(WaitStep::TimedOut(self.timed_out_outcome(now)))
                     } else {
                         Ok(WaitStep::Pending)
                     };
+                };
+                if now >= deadline {
+                    return Ok(WaitStep::Publish(WaitPublication {
+                        frame,
+                        settled: false,
+                        elapsed_ms,
+                        activity_bbox,
+                    }));
                 }
-                self.activity_bbox = difference.changed_bbox;
                 self.phase = WaitPhase::Settling {
                     previous: frame,
                     unchanged_since: now,
-                    first_change_at: now,
-                    deadline: now + self.settle_max,
+                    activity_bbox,
                 };
                 Ok(WaitStep::Pending)
             }
             WaitPhase::Settling {
                 previous,
                 unchanged_since,
-                first_change_at,
-                deadline,
+                activity_bbox,
             } => {
-                let difference = compare_masked(previous, &frame, &self.mask);
-                if difference.changed_pixels > 0 {
-                    self.activity_bbox = union_rects(self.activity_bbox, difference.changed_bbox);
+                if let Some(changed_bbox) = compare_masked(previous, &frame, &self.mask) {
+                    *activity_bbox = union_rects(*activity_bbox, changed_bbox);
                     *previous = frame.clone();
                     *unchanged_since = now;
                 }
 
-                let coalesced = now.saturating_duration_since(*first_change_at) >= self.coalesce;
                 let quiet = now.saturating_duration_since(*unchanged_since) >= self.quiet;
-                let Some(activity_bbox) = self.activity_bbox else {
-                    return Err(CuError::new(
-                        ErrorCode::Internal,
-                        "wait settling state omitted its activity bounds",
-                    ));
-                };
-                if coalesced && quiet {
+                if quiet {
                     return Ok(WaitStep::Publish(WaitPublication {
                         frame,
                         settled: true,
                         elapsed_ms,
-                        activity_bbox,
+                        activity_bbox: *activity_bbox,
                     }));
                 }
-                if now >= *deadline {
+                if now >= deadline {
                     Ok(WaitStep::Publish(WaitPublication {
                         frame,
                         settled: false,
                         elapsed_ms,
-                        activity_bbox,
+                        activity_bbox: *activity_bbox,
                     }))
                 } else {
                     Ok(WaitStep::Pending)
@@ -798,17 +755,8 @@ impl WaitTracker {
     }
 }
 
-struct FrameDifference {
-    changed_pixels: u64,
-    changed_bbox: Option<Rect>,
-}
-
-fn compare_masked(
-    first: &CapturedFrame,
-    second: &CapturedFrame,
-    mask: &WatchMask,
-) -> FrameDifference {
-    let mut changed_pixels = 0_u64;
+fn compare_masked(first: &CapturedFrame, second: &CapturedFrame, mask: &WatchMask) -> Option<Rect> {
+    let mut changed = false;
     let mut min_x = u32::MAX;
     let mut min_y = u32::MAX;
     let mut max_x = 0_u32;
@@ -817,7 +765,7 @@ fn compare_masked(
         for x in span.left..span.right {
             let offset = pixel_offset(first.width, x, span.y);
             if first.pixels[offset..offset + 3] != second.pixels[offset..offset + 3] {
-                changed_pixels += 1;
+                changed = true;
                 min_x = min_x.min(x);
                 min_y = min_y.min(span.y);
                 max_x = max_x.max(x);
@@ -825,7 +773,7 @@ fn compare_masked(
             }
         }
     }
-    let changed_bbox = if changed_pixels > 0 {
+    if changed {
         Some(Rect {
             x: min_x,
             y: min_y,
@@ -834,10 +782,6 @@ fn compare_masked(
         })
     } else {
         None
-    };
-    FrameDifference {
-        changed_pixels,
-        changed_bbox,
     }
 }
 
@@ -867,21 +811,16 @@ fn elapsed_millis(start: Instant, now: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
 }
 
-fn union_rects(first: Option<Rect>, second: Option<Rect>) -> Option<Rect> {
-    match (first, second) {
-        (None, rect) | (rect, None) => rect,
-        (Some(first), Some(second)) => {
-            let left = first.x.min(second.x);
-            let top = first.y.min(second.y);
-            let right = (first.x + first.width).max(second.x + second.width);
-            let bottom = (first.y + first.height).max(second.y + second.height);
-            Some(Rect {
-                x: left,
-                y: top,
-                width: right - left,
-                height: bottom - top,
-            })
-        }
+fn union_rects(first: Rect, second: Rect) -> Rect {
+    let left = first.x.min(second.x);
+    let top = first.y.min(second.y);
+    let right = (first.x + first.width).max(second.x + second.width);
+    let bottom = (first.y + first.height).max(second.y + second.height);
+    Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
     }
 }
 
@@ -1408,7 +1347,6 @@ mod tests {
             width: 100,
             height: 80,
             target: "mock:screen".to_owned(),
-            resampled: false,
         }
     }
 
@@ -1418,7 +1356,6 @@ mod tests {
             width: 8,
             height: 6,
             target: "mock:small".to_owned(),
-            resampled: false,
         }
     }
 
@@ -1428,7 +1365,6 @@ mod tests {
             width: 9,
             height: 6,
             target: "mock:small".to_owned(),
-            resampled: false,
         }
     }
 
@@ -1465,9 +1401,7 @@ mod tests {
                 height: 1,
             }],
             timeout_ms: 1_000,
-            coalesce_ms: 100,
             quiet_ms: 100,
-            settle_max_ms: 300,
         }
     }
 
@@ -1529,26 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn status_returns_the_latest_frame_without_capturing() {
-        let directory = TempDir::new().unwrap();
-        let executed = Arc::new(Mutex::new(Vec::new()));
-        let baseline = small_frame(1);
-        let mut engine = engine(&directory, vec![baseline.clone(), baseline], executed);
-        let observed = observe(&mut engine);
-
-        let response = engine.handle(RequestEnvelope {
-            request_id: "status-1".to_owned(),
-            request: DaemonRequest::Status,
-        });
-
-        let ResponseResult::Ok(DaemonResponse::Status(Some(status))) = response.result else {
-            panic!("expected frame status");
-        };
-        assert_eq!(status.frame_id, observed.frame_id);
-        assert_eq!((status.width, status.height), (8, 6));
-    }
-
-    #[test]
     fn wait_timeout_publishes_nothing_and_preserves_the_baseline() {
         let directory = TempDir::new().unwrap();
         let baseline = small_frame(1);
@@ -1572,11 +1486,7 @@ mod tests {
             panic!("expected unchanged timeout");
         };
 
-        assert_eq!(outcome.status, WaitStatus::Timeout);
-        assert_eq!(outcome.elapsed_ms, 1_000);
-        assert_eq!(outcome.frame_id, observed.frame_id);
-        assert!(outcome.activity_bbox.is_none());
-        assert!(outcome.observation.is_none());
+        assert_eq!(outcome, WaitOutcome::Timeout { elapsed_ms: 1_000 });
         assert_eq!(engine.latest().unwrap().frame_id, observed.frame_id);
         assert_eq!(
             fs::read_dir(directory.path().join("frames"))
@@ -1585,6 +1495,40 @@ mod tests {
                 .filter(|entry| entry.path().extension() == Some(OsStr::new("png")))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn change_on_the_total_deadline_returns_an_unsettled_frame() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline.clone()],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let start = Instant::now();
+        let mut request = wait_request(observed.frame_id);
+        request.timeout_ms = 500;
+        let mut tracker = engine.begin_wait(&request, start).unwrap();
+
+        let Ok(WaitStep::Publish(publication)) = tracker.observe_sample(
+            with_pixel(&baseline, 2, 2, 2),
+            start + Duration::from_millis(500),
+        ) else {
+            panic!("a terminal sample change must not be reported as a timeout");
+        };
+        assert!(!publication.settled);
+        assert_eq!(publication.elapsed_ms, 500);
+        assert_eq!(
+            publication.activity_bbox,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 1,
+                height: 1,
+            }
         );
     }
 
@@ -1639,26 +1583,29 @@ mod tests {
             .publish_wait(&tracker, publication, &AtomicBool::new(false))
             .unwrap();
 
-        assert_eq!(outcome.status, WaitStatus::Changed);
-        assert_eq!(outcome.elapsed_ms, 450);
+        let WaitOutcome::Changed {
+            elapsed_ms,
+            activity_bbox,
+            observation,
+        } = outcome
+        else {
+            panic!("expected changed outcome");
+        };
+        assert_eq!(elapsed_ms, 450);
         assert_eq!(
-            outcome.activity_bbox,
-            Some(Rect {
+            activity_bbox,
+            Rect {
                 x: 2,
                 y: 0,
                 width: 5,
                 height: 3
-            })
+            }
         );
-        assert_eq!(
-            outcome.frame_id,
-            outcome.observation.as_ref().unwrap().frame_id
-        );
-        assert!(outcome.observation.unwrap().settled);
+        assert!(observation.settled);
     }
 
     #[test]
-    fn wait_holds_a_quiet_frame_until_the_coalesce_window_finishes() {
+    fn wait_requires_one_contiguous_quiet_period() {
         let directory = TempDir::new().unwrap();
         let baseline = small_frame(1);
         let mut engine = engine(
@@ -1669,61 +1616,30 @@ mod tests {
         let observed = observe(&mut engine);
         let start = Instant::now();
         let mut request = wait_request(observed.frame_id);
-        request.coalesce_ms = 200;
-        request.quiet_ms = 50;
+        request.quiet_ms = 200;
         let mut tracker = engine.begin_wait(&request, start).unwrap();
-        let changed = with_pixel(&baseline, 2, 2, 2);
+        let first = with_pixel(&baseline, 2, 2, 2);
 
         assert!(matches!(
-            tracker.observe_sample(changed.clone(), start + Duration::from_millis(100)),
+            tracker.observe_sample(first, start + Duration::from_millis(100)),
+            Ok(WaitStep::Pending)
+        ));
+        let second = with_pixel(&baseline, 2, 2, 3);
+        assert!(matches!(
+            tracker.observe_sample(second.clone(), start + Duration::from_millis(250)),
             Ok(WaitStep::Pending)
         ));
         assert!(matches!(
-            tracker.observe_sample(changed.clone(), start + Duration::from_millis(160)),
-            Ok(WaitStep::Pending)
-        ));
-        assert!(matches!(
-            tracker.observe_sample(changed, start + Duration::from_millis(299)),
-            Ok(WaitStep::Pending)
-        ));
-        let Ok(WaitStep::Publish(publication)) = tracker.observe_sample(
-            with_pixel(&baseline, 2, 2, 2),
-            start + Duration::from_millis(300),
-        ) else {
-            panic!("expected publication at the coalesce boundary");
-        };
-        assert!(publication.settled);
-        assert_eq!(publication.elapsed_ms, 300);
-    }
-
-    #[test]
-    fn zero_coalesce_publishes_on_the_first_quiet_sample() {
-        let directory = TempDir::new().unwrap();
-        let baseline = small_frame(1);
-        let mut engine = engine(
-            &directory,
-            vec![baseline.clone(), baseline.clone()],
-            Arc::new(Mutex::new(Vec::new())),
-        );
-        let observed = observe(&mut engine);
-        let start = Instant::now();
-        let mut request = wait_request(observed.frame_id);
-        request.coalesce_ms = 0;
-        request.quiet_ms = 50;
-        let mut tracker = engine.begin_wait(&request, start).unwrap();
-        let changed = with_pixel(&baseline, 2, 2, 2);
-
-        assert!(matches!(
-            tracker.observe_sample(changed.clone(), start + Duration::from_millis(100)),
+            tracker.observe_sample(second.clone(), start + Duration::from_millis(449)),
             Ok(WaitStep::Pending)
         ));
         let Ok(WaitStep::Publish(publication)) =
-            tracker.observe_sample(changed, start + Duration::from_millis(150))
+            tracker.observe_sample(second, start + Duration::from_millis(450))
         else {
-            panic!("expected publication on the first quiet sample");
+            panic!("expected publication after contiguous quiet");
         };
         assert!(publication.settled);
-        assert_eq!(publication.elapsed_ms, 150);
+        assert_eq!(publication.elapsed_ms, 450);
     }
 
     #[test]
@@ -1775,6 +1691,27 @@ mod tests {
     }
 
     #[test]
+    fn wait_rejects_a_fully_excluded_watch_mask() {
+        let directory = TempDir::new().unwrap();
+        let baseline = small_frame(1);
+        let mut engine = engine(
+            &directory,
+            vec![baseline.clone(), baseline],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let observed = observe(&mut engine);
+        let mut request = wait_request(observed.frame_id);
+        request.exclude_rects = request.include_rects.clone();
+
+        let error = engine
+            .begin_wait(&request, Instant::now())
+            .err()
+            .expect("a fully excluded mask must fail");
+        assert_eq!(error.code, ErrorCode::InvalidAction);
+        assert!(error.message.contains("entire included region"));
+    }
+
+    #[test]
     fn wait_latches_transient_activity_and_flicker_can_publish_unsettled() {
         let directory = TempDir::new().unwrap();
         let baseline = small_frame(1);
@@ -1785,9 +1722,9 @@ mod tests {
         );
         let observed = observe(&mut engine);
         let start = Instant::now();
-        let mut tracker = engine
-            .begin_wait(&wait_request(observed.frame_id.clone()), start)
-            .unwrap();
+        let mut request = wait_request(observed.frame_id.clone());
+        request.timeout_ms = 500;
+        let mut tracker = engine.begin_wait(&request, start).unwrap();
         let first = with_pixel(&baseline, 2, 2, 2);
         assert!(matches!(
             tracker.observe_sample(first, start + Duration::from_millis(100)),
@@ -1811,7 +1748,7 @@ mod tests {
         let Ok(WaitStep::Publish(WaitPublication { settled, .. })) =
             tracker.observe_sample(second, start + Duration::from_millis(500))
         else {
-            panic!("expected settle-timeout publication");
+            panic!("expected deadline publication");
         };
         assert!(!settled);
     }
@@ -1940,11 +1877,13 @@ mod tests {
             else {
                 panic!("expected changed publication");
             };
-            observed = engine
+            let WaitOutcome::Changed { observation, .. } = engine
                 .publish_wait(&tracker, publication, &cancelled)
                 .unwrap()
-                .observation
-                .unwrap();
+            else {
+                panic!("expected changed outcome");
+            };
+            observed = observation;
         }
 
         assert_eq!(

@@ -210,7 +210,6 @@ impl X11Backend {
             width: frame.width,
             height: frame.height,
             target: format!("x11:{}:screen:{}", self.display, self.screen_index),
-            resampled,
         })
     }
 
