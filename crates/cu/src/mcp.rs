@@ -1,3 +1,7 @@
+mod signal;
+mod transport;
+mod wait;
+
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -21,7 +25,7 @@ use rmcp::{
     },
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{async_rw::AsyncRwTransport, stdio},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,8 +34,9 @@ use tokio::{sync::Mutex, time::MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::client;
+use wait::{AsyncWaits, McpWaitStarted};
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait returns after watched pixels change and stay quiet, or when its timeout ends. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait blocks by default; async:true returns a private signal_path for terminal JSON. For longer waits, prefer async:true with an available monitor tool: the completed JSON is a Bash-visible condition. Arm the monitor, then do unrelated work or end the turn until notified. The monitor may wake on changed, timeout, or error; cancelled must stay silent. After a wake, call computer_observe for a fresh screenshot. Observe cancels a pending async wait. Async waits belong to this MCP process and end when it exits. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
 const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
@@ -71,6 +76,9 @@ struct McpWaitRequest {
     #[serde(default = "default_wait_quiet_ms")]
     #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
+    /// Return a `signal_path` immediately instead of blocking. Read terminal JSON status; cancelled is silent.
+    #[serde(default, rename = "async")]
+    async_mode: bool,
 }
 
 const fn default_wait_timeout_ms() -> u64 {
@@ -126,6 +134,14 @@ struct McpWaitOutcome {
     /// Bounding box covering monitored activity since the first change.
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_bbox: Option<Rect>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(extend("type" = "object"))]
+enum McpWaitReply {
+    Finished(McpWaitOutcome),
+    Started(McpWaitStarted),
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -379,17 +395,20 @@ pub struct ComputerUseMcp {
     instructions: String,
     session_id: Uuid,
     state: Arc<Mutex<McpSessionState>>,
+    waits: AsyncWaits,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl ComputerUseMcp {
     pub fn new(socket: PathBuf, profile: Option<&str>) -> Self {
+        let session_id = Uuid::new_v4();
         Self {
             socket,
             instructions: compose_instructions(profile),
-            session_id: Uuid::new_v4(),
+            session_id,
             state: Arc::new(Mutex::new(McpSessionState::default())),
+            waits: AsyncWaits::new(crate::default_runtime_dir(), session_id),
             tool_router: Self::tool_router(),
         }
     }
@@ -417,6 +436,7 @@ impl ComputerUseMcp {
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
+        self.waits.cancel().await;
         let response = match self
             .request_daemon(Uuid::new_v4().to_string(), DaemonRequest::Observe(request))
             .await
@@ -468,8 +488,8 @@ impl ComputerUseMcp {
     }
 
     #[tool(
-        description = "Wait for an expected GUI change without polling. Returns after watched pixels changed or timeout, with a PNG on change. If changed results return repeatedly and quickly, narrow or exclude noisy regions.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<McpWaitOutcome>(),
+        description = "Wait for an expected GUI change. Blocks by default, returning a PNG on change. For longer waits, prefer async:true with an available monitor tool. It returns signal_path immediately; terminal JSON there provides a Bash-visible completion condition. Arm the monitor, then do unrelated work or idle until notified. Wake on changed, timeout, or error; cancelled stays silent. Observe cancels a pending async wait; observe again after waking. If changes repeat quickly, narrow or exclude noisy regions.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<McpWaitReply>(),
         annotations(
             title = "Wait for computer change",
             read_only_hint = true,
@@ -500,6 +520,11 @@ impl ComputerUseMcp {
             timeout_ms: request.timeout_ms,
             quiet_ms: request.quiet_ms,
         };
+        if request.async_mode {
+            return self
+                .start_async_wait(protocol_request, baseline, &context)
+                .await;
+        }
         let response = match self.request_wait_daemon(protocol_request, &context).await {
             Ok(response) => response,
             Err(result) => {
@@ -561,6 +586,7 @@ impl ComputerUseMcp {
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
+        let is_retry = state.completed_actions.contains_key(&request_id);
         let protocol_request = match state.prepare_action(&request_id, &request) {
             Ok(request) => request,
             Err(error) => {
@@ -631,6 +657,9 @@ impl ComputerUseMcp {
                     }
                 } else {
                     state.commit(binding);
+                    if !is_retry && let Some(current) = &state.current {
+                        self.waits.cancel_if_superseded(&current.internal_id).await;
+                    }
                 }
                 Ok(result)
             }
@@ -661,6 +690,36 @@ impl ComputerUseMcp {
                 "message": error.to_string(),
             }))),
         }
+    }
+
+    async fn start_async_wait(
+        &self,
+        request: WaitRequest,
+        baseline: FrameBinding,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut state = self.state.lock().await;
+        if context.ct.is_cancelled() {
+            return Ok(cancelled_result());
+        }
+        if let Err(error) = state.ensure_current(&baseline) {
+            return Ok(structured_error(&error));
+        }
+        let started = match self.waits.start(
+            self.socket.clone(),
+            request,
+            baseline.clone(),
+            Arc::clone(&self.state),
+        ) {
+            Ok(started) => started,
+            Err(error) => return Ok(structured_error(&error)),
+        };
+        if context.ct.is_cancelled() {
+            self.waits.cancel().await;
+            state.clear_if_current(&baseline);
+            return Ok(cancelled_result());
+        }
+        Ok(structured_result(McpWaitReply::Started(started)))
     }
 
     async fn request_wait_daemon(
@@ -706,13 +765,13 @@ impl ComputerUseMcp {
                 if let Err(error) = state.ensure_current(&baseline) {
                     return Ok(structured_error(&error));
                 }
-                Ok(structured_result(McpWaitOutcome {
+                Ok(structured_result(McpWaitReply::Finished(McpWaitOutcome {
                     status: McpWaitStatus::Timeout,
                     elapsed_ms,
                     frame: baseline.frame,
                     settled: true,
                     activity_bbox: None,
-                }))
+                })))
             }
             WaitOutcome::Changed {
                 elapsed_ms,
@@ -726,13 +785,13 @@ impl ComputerUseMcp {
                         Err(error) => return Ok(structured_error(&error)),
                     };
                 let result = image_result(
-                    McpWaitOutcome {
+                    McpWaitReply::Finished(McpWaitOutcome {
                         status: McpWaitStatus::Changed,
                         elapsed_ms,
                         frame: binding.frame,
                         settled: observation.settled,
                         activity_bbox: Some(activity_bbox),
-                    },
+                    }),
                     observation.image_path,
                 )
                 .await?;
@@ -787,12 +846,44 @@ pub async fn serve(socket: PathBuf) -> anyhow::Result<()> {
             None
         }
     };
-    ComputerUseMcp::new(socket, profile.as_deref())
-        .serve(stdio())
-        .await?
-        .waiting()
-        .await?;
-    Ok(())
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let server = ComputerUseMcp::new(socket, profile.as_deref());
+    let owner = server.waits.owner();
+    let shutdown = async {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
+            result = terminate.recv() => result.ok_or_else(|| anyhow::anyhow!("SIGTERM listener closed")),
+        }
+    };
+    tokio::pin!(shutdown);
+    let (stdin, stdout) = stdio();
+    let transport = transport::WaitTransport::new(
+        AsyncRwTransport::new_server(stdin, stdout),
+        server.waits.clone(),
+    );
+    let running = tokio::select! {
+        result = server.serve(transport) => result?,
+        signal = &mut shutdown => {
+            owner.shutdown().await;
+            return signal;
+        }
+    };
+    let cancellation = running.cancellation_token();
+    let waiting = running.waiting();
+    tokio::pin!(waiting);
+    let result = tokio::select! {
+        result = &mut waiting => result.map(|_| ()).map_err(anyhow::Error::from),
+        signal = &mut shutdown => {
+            // Close the independent publication gate before rmcp drains handlers.
+            // A hung observe/act must not hold up async wait cleanup.
+            owner.shutdown().await;
+            cancellation.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut waiting).await;
+            signal
+        }
+    };
+    owner.shutdown().await;
+    result
 }
 
 fn compose_instructions(profile: Option<&str>) -> String {
@@ -1075,6 +1166,15 @@ mod tests {
         assert_eq!(wait_annotations.idempotent_hint, Some(false));
 
         let wait_schema = wait.input_schema;
+        assert_eq!(wait_schema["properties"]["async"]["type"], "boolean");
+        assert_eq!(wait_schema["properties"]["async"]["default"], false);
+        assert!(
+            !wait_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "async")
+        );
         assert_eq!(wait_schema["properties"]["frame"]["minimum"], 1);
         assert_eq!(wait_schema["properties"]["include_rects"]["minItems"], 1);
         assert_eq!(wait_schema["properties"]["include_rects"]["maxItems"], 8);
@@ -1089,6 +1189,9 @@ mod tests {
         assert!(wait_schema["properties"].get("settle_max_ms").is_none());
 
         let wait_output = wait.output_schema.unwrap();
+        assert_eq!(wait_output["type"], "object");
+        assert_eq!(wait_output["anyOf"].as_array().unwrap().len(), 2);
+        let wait_output = &wait_output["$defs"]["McpWaitOutcome"];
         assert_eq!(wait_output["properties"]["elapsed_ms"]["type"], "integer");
         assert_eq!(wait_output["properties"]["frame"]["minimum"], 1);
         assert!(wait_output["properties"].get("frame_id").is_none());
@@ -1419,6 +1522,7 @@ mod tests {
     fn wait_results_contain_every_schema_required_field() {
         let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
         let wait_output = tool(&server, "computer_wait").output_schema.unwrap();
+        let wait_output = &wait_output["$defs"]["McpWaitOutcome"];
         let outcomes = [
             McpWaitOutcome {
                 status: McpWaitStatus::Timeout,

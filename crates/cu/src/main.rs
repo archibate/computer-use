@@ -201,9 +201,24 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    match Cli::parse().command {
+fn main() -> Result<()> {
+    let command = Cli::parse().command;
+    let mcp_stdio = matches!(&command, Command::Mcp { .. });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run(command));
+    if mcp_stdio {
+        // Tokio's stdin reader can remain blocked after a signal with stdin
+        // still open. mcp::serve has already closed its wait publication gate
+        // and joined its worker; do not wait indefinitely for that input thread.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
+    result
+}
+
+async fn run(command: Command) -> Result<()> {
+    match command {
         Command::Daemon {
             instance,
             backend,

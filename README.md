@@ -181,9 +181,9 @@ It exposes three tools:
 - `computer_act` requires that latest `frame`, executes a validated batch, and
   returns execution metadata plus the next numbered observation and PNG.
 - `computer_wait` requires that latest `frame`, watches included regions
-  minus optional exclusions, and blocks without repeated model polling. It
+  minus optional exclusions, and blocks by default without repeated model polling. It
   returns a flat current `frame`; only a changed result includes a PNG and
-  `activity_bbox`.
+  `activity_bbox`. Optional `async:true` returns a completion-file path instead.
 
 The published schemas describe every action, coordinate and key convention,
 settling limits, partial execution, and stale-frame recovery.
@@ -207,6 +207,69 @@ command = "cu"
 args = ["mcp"]
 tool_timeout_sec = 100000
 ```
+
+### Asynchronous MCP waits
+
+For longer waits, prefer async mode with a monitor tool when one is available.
+The completed JSON at `signal_path` is a Bash-visible condition: use Claude
+Code's Monitor tool or the curated `monitor-wakeup` skill in Codex to watch its
+terminal status and notify the agent. Once the monitor is armed, continue
+unrelated work or end the turn and stay idle until notified. The wait keeps
+running while its MCP process stays alive.
+
+Pass `"async":true` with the same frame, regions, and timing parameters:
+
+```json
+{"frame":1,"include_rects":[{"x":780,"y":120,"width":800,"height":720}],"async":true}
+```
+
+The tool immediately returns `{"status":"started","signal_path":"..."}`.
+This means the MCP process accepted the background task; daemon rejection
+(including `busy`), connection failure, or invalid regions can arrive in the
+result file. Omitting `async` or setting it to `false` preserves the blocking
+behavior. The CLI and daemon protocol remain synchronous.
+
+The MCP process holds the existing daemon wait connection until completion.
+There is still one active wait per daemon, and a second pending async wait in
+the same MCP process returns `busy`. `computer_observe` cancels a pending async
+wait before requesting its screenshot. A new action that commits a new frame
+also cancels it; validation failures and cached action replays do not. Other
+clients' baseline supersession produces `cancelled`. There is no cancel tool.
+
+The private final JSON file appears atomically, with one terminal status:
+
+| Status | Additional fields | External watcher |
+| --- | --- | --- |
+| `changed` | `elapsed_ms`, `activity_bbox`, `settled` | Wake once |
+| `timeout` | `elapsed_ms` | Wake once |
+| `error` | `elapsed_ms`, `code`, `message` | Wake once |
+| `cancelled` | `elapsed_ms` | Exit silently |
+
+Read the status before waking: file existence alone also detects cancellation.
+Check immediately, then poll once per second with a bounded detector lifetime.
+An event-based detector must register a watch on the containing directory
+**before** checking for an existing file, so completion during setup is not lost.
+Exit silently if the session directory disappears or the detector's own deadline
+expires without a result. Never notify from an exit or cleanup handler. A wait
+timeout is a published `timeout` result; a detector deadline is not proof that
+the wait completed. cu neither executes callbacks nor calls Codex; an external
+watcher such as `monitor-wakeup` owns any continuation.
+
+After waking, call `computer_observe` for a fresh screenshot and frame. The file
+contains notification metadata only, without a frame number or image path.
+Changed results clear the old MCP frame binding; unchanged timeouts preserve it.
+If completion wins the race with cancellation, its published result remains;
+an already-issued wake-up cannot be withdrawn.
+
+Paths are unique per wait under
+`$XDG_RUNTIME_DIR/computer-use/mcp-waits/<session>/<wait>.json`, using the usual
+`/run/user/<uid>` fallback. Directories are `0700` and files `0600`. Each MCP
+process retains at most its latest result, deleting it on the next accepted
+async start. MCP EOF, SIGTERM, or SIGINT cancels the worker and removes its private
+session directory. Daemon loss while MCP remains alive produces `error`.
+SIGKILL or a crash cannot guarantee cleanup or a terminal file; remaining files
+last until runtime-directory cleanup. A publication failure is logged, releases
+the task, and leaves no partial final JSON; the detector's bound covers it.
 
 Repeated changed results with unexpectedly small `elapsed_ms` indicate an
 active included region. Narrow the includes or exclude blinking cursors and

@@ -98,6 +98,7 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
         .iter()
         .find(|tool| tool["name"] == "computer_wait")
         .unwrap();
+    assert_eq!(wait["outputSchema"]["type"], "object");
     assert_eq!(
         observe["outputSchema"]["properties"]["frame"]["type"],
         "integer"
@@ -108,7 +109,7 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
         1
     );
     assert_eq!(
-        wait["outputSchema"]["properties"]["elapsed_ms"]["type"],
+        wait["outputSchema"]["$defs"]["McpWaitOutcome"]["properties"]["elapsed_ms"]["type"],
         "integer"
     );
 }
