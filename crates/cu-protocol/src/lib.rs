@@ -12,7 +12,7 @@ pub const MAX_INCLUDE_RECTS: usize = 8;
 pub const MAX_EXCLUDE_RECTS: usize = 8;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
 pub const MAX_WAIT_QUIET_MS: u64 = 60_000;
-pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 3_600_000;
 pub const DEFAULT_WAIT_QUIET_MS: u64 = 2_000;
 
 /// Mouse button used by a click action.

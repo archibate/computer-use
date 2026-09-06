@@ -133,7 +133,7 @@ cu wait --last-frame-id "<frame_id from cu observe>" \
   --include 780,120,800,720 \
   --include 40,120,700,720 \
   --exclude 1490,120,80,30 \
-  --timeout-ms 600000 \
+  --timeout-ms 3600000 \
   --quiet-ms 30000
 ```
 
@@ -145,7 +145,8 @@ baseline-frame `x,y,width,height` coordinates.
 `timeout_ms` is the total budget. After the first change, another monitored
 pixel change restarts `quiet_ms`. If the deadline arrives before a full quiet
 period, the latest changed frame is returned with `settled:false`. Defaults are
-30000 ms total and 2000 ms quiet. The daemon samples every 500 ms internally.
+3600000 ms (1 hour) total and 2000 ms quiet. The daemon samples every 500 ms
+internally.
 
 An unchanged timeout returns `status:"timeout"` and `elapsed_ms`, without an
 image or frame-store publication; re-arm it with the same baseline. Activity
@@ -197,17 +198,15 @@ cancellation, or `viewport_changed`.
 `computer_wait` emits rate-limited progress notifications when the MCP client
 supplies a progress token and propagates cancellation by dropping the daemon
 connection. Its duration is `timeout_ms` plus terminal capture and PNG encoding.
-Configure the MCP host deadline above that bound. For example, this gives a
-ten-minute Codex wait generous headroom:
+Configure the MCP host deadline above that bound. This Codex configuration
+allows a full one-hour wait, including capture and encoding:
 
 ```toml
 [mcp_servers.cu]
 command = "cu"
 args = ["mcp"]
-tool_timeout_sec = 3600
+tool_timeout_sec = 100000
 ```
-
-A full one-hour wait needs a deadline above 3600 seconds.
 
 Repeated changed results with unexpectedly small `elapsed_ms` indicate an
 active included region. Narrow the includes or exclude blinking cursors and
