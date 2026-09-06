@@ -14,7 +14,6 @@ pub(super) struct SignalStore {
     runtime_dir: PathBuf,
     session_dir: PathBuf,
     identity: Option<(u64, u64)>,
-    retained: Option<PathBuf>,
     closed: bool,
 }
 
@@ -47,7 +46,6 @@ impl SignalStore {
             runtime_dir,
             session_dir,
             identity: None,
-            retained: None,
             closed: false,
         }
     }
@@ -66,18 +64,11 @@ impl SignalStore {
             .mode(0o600)
             .open(&staging_path)
             .map_err(|error| storage_error(format!("failed to create wait signal: {error}")))?;
-        let prepared = PreparedSignal {
+        Ok(PreparedSignal {
             path,
             staging_path,
             file: Some(file),
-        };
-        if let Some(previous) = &self.retained {
-            remove_file_if_present(previous).map_err(|error| {
-                storage_error(format!("failed to retire previous wait signal: {error}"))
-            })?;
-        }
-        self.retained = None;
-        Ok(prepared)
+        })
     }
 
     pub(super) fn publish(
@@ -85,6 +76,9 @@ impl SignalStore {
         mut prepared: PreparedSignal,
         result: &impl Serialize,
     ) -> Result<(), CuError> {
+        if self.closed {
+            return Err(storage_error("MCP wait signal store is closed"));
+        }
         self.validate_session()?;
         if prepared.path.parent() != Some(self.session_dir.as_path()) {
             return Err(storage_error("wait signal belongs to a different session"));
@@ -100,7 +94,6 @@ impl SignalStore {
         fs::rename(&prepared.staging_path, &prepared.path).map_err(|error| {
             storage_error(format!("failed to publish wait signal result: {error}"))
         })?;
-        self.retained = Some(prepared.path.clone());
         Ok(())
     }
 
@@ -112,16 +105,19 @@ impl SignalStore {
         if self.identity.is_none() {
             return;
         }
-        let result = self.validate_session().and_then(|()| {
-            fs::remove_dir_all(&self.session_dir).map_err(|error| {
-                storage_error(format!("failed to remove wait session directory: {error}"))
-            })
-        });
+        let result =
+            self.validate_session()
+                .and_then(|()| match fs::remove_dir(&self.session_dir) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+                    Err(error) => Err(storage_error(format!(
+                        "failed to remove empty wait session directory: {error}"
+                    ))),
+                });
         if let Err(error) = result {
             eprintln!("failed to clean MCP wait signals: {}", error.message);
         }
         self.identity = None;
-        self.retained = None;
     }
 
     fn prepare_directories(&mut self) -> Result<(), CuError> {
@@ -249,19 +245,28 @@ mod tests {
     }
 
     #[test]
-    fn next_prepare_retires_previous_result_and_uses_a_new_identity() {
+    fn next_prepare_preserves_previous_results_for_late_detectors() {
         let root = tempfile::tempdir().unwrap();
         let mut store = store(root.path());
         let first = store.prepare().unwrap();
         let first_path = first.path().to_owned();
-        store.publish(first, &json!({"status": "timeout"})).unwrap();
-        assert!(first_path.exists());
+        let first_result = json!({"status": "cancelled", "elapsed_ms": 4});
+        store.publish(first, &first_result).unwrap();
         let second = store.prepare().unwrap();
         assert_ne!(first_path, second.path());
-        assert!(!first_path.exists());
         assert!(!second.path().exists());
-        drop(second);
-        assert_eq!(fs::read_dir(&store.session_dir).unwrap().count(), 0);
+        let second_path = second.path().to_owned();
+        let second_result = json!({"status": "timeout", "elapsed_ms": 20});
+        store.publish(second, &second_result).unwrap();
+        let third = store.prepare().unwrap();
+        for (path, expected) in [(&first_path, &first_result), (&second_path, &second_result)] {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+                *expected
+            );
+        }
+        drop(third);
+        assert_eq!(fs::read_dir(&store.session_dir).unwrap().count(), 2);
     }
 
     #[test]
@@ -282,15 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_its_own_session_and_prevents_reuse() {
+    fn cleanup_removes_only_its_own_empty_session_and_prevents_reuse() {
         let root = tempfile::tempdir().unwrap();
         let mut first = store(root.path());
         let mut second = store(root.path());
-        let first_signal = first.prepare().unwrap();
+        drop(first.prepare().unwrap());
         let second_signal = second.prepare().unwrap();
-        first
-            .publish(first_signal, &json!({"status": "cancelled"}))
-            .unwrap();
         let second_path = second_signal.path().to_owned();
         second
             .publish(second_signal, &json!({"status": "timeout"}))
@@ -300,7 +302,61 @@ mod tests {
         assert!(second_path.exists());
         assert!(first.prepare().is_err());
         second.cleanup();
-        assert!(!second_path.exists());
+        assert!(second_path.exists());
+        assert!(second.prepare().is_err());
+    }
+
+    #[test]
+    fn cleanup_and_drop_preserve_results_until_the_consumer_removes_them() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = store(root.path());
+        let prepared = store.prepare().unwrap();
+        let path = prepared.path().to_owned();
+        let session_dir = store.session_dir.clone();
+        let result = json!({"status": "cancelled", "elapsed_ms": 4});
+        store.publish(prepared, &result).unwrap();
+        store.cleanup();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            result
+        );
+        drop(store);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            result
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(session_dir).unwrap();
+    }
+
+    #[test]
+    fn drop_without_explicit_cleanup_preserves_published_results() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = store(root.path());
+        let prepared = store.prepare().unwrap();
+        let path = prepared.path().to_owned();
+        let result = json!({"status": "changed", "elapsed_ms": 4});
+        store.publish(prepared, &result).unwrap();
+        drop(store);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn drop_removes_an_empty_session_after_the_consumer_removes_its_result() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = store(root.path());
+        let prepared = store.prepare().unwrap();
+        let path = prepared.path().to_owned();
+        let session_dir = store.session_dir.clone();
+        store
+            .publish(prepared, &json!({"status": "cancelled"}))
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        drop(store);
+        assert!(!session_dir.exists());
     }
 
     #[test]
@@ -386,6 +442,11 @@ mod tests {
         let mut store = store(root.path());
         let prepared = store.prepare().unwrap();
         let path = prepared.path().to_owned();
+        let retained = store.prepare().unwrap();
+        let retained_path = retained.path().to_owned();
+        store
+            .publish(retained, &json!({"status": "cancelled"}))
+            .unwrap();
         store.cleanup();
         assert!(
             store
@@ -393,7 +454,8 @@ mod tests {
                 .is_err()
         );
         assert!(!path.exists());
-        assert!(!store.session_dir.exists());
+        assert!(retained_path.exists());
+        assert_eq!(fs::read_dir(&store.session_dir).unwrap().count(), 1);
     }
 
     #[test]

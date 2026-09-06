@@ -18,7 +18,7 @@ const LIMIT: Duration = Duration::from_secs(5);
 
 #[test]
 #[ignore = "requires local Unix socket access"]
-fn async_wait_detaches_then_retains_one_private_result_and_invalidates_changed_frame() {
+fn async_wait_retains_private_results_across_new_starts_and_shutdown() {
     let mut mcp = McpFixture::new();
     mcp.observe(2, "baseline");
     let first_path = mcp.start_wait(3, 1);
@@ -62,10 +62,7 @@ fn async_wait_detaches_then_retains_one_private_result_and_invalidates_changed_f
 
     let second_path = mcp.start_wait(4, 1);
     assert_ne!(first_path, second_path);
-    assert!(
-        !first_path.exists(),
-        "next accepted wait expires the previous result"
-    );
+    assert_eq!(terminal_result(&first_path), first_result);
     let waiting = mcp.daemon_call();
     let DaemonRequest::Wait(request) = &waiting.request.request else {
         panic!("expected daemon wait");
@@ -105,7 +102,17 @@ fn async_wait_detaches_then_retains_one_private_result_and_invalidates_changed_f
         "rejected start retains the previous result"
     );
     mcp.close();
-    assert!(!second_path.parent().unwrap().exists());
+    assert_eq!(terminal_result(&first_path), first_result);
+    assert_eq!(terminal_result(&second_path)["status"], "changed");
+    assert_eq!(watcher_wake_count(&first_path), 1);
+    assert_eq!(watcher_wake_count(&second_path), 1);
+    assert_eq!(
+        std::fs::read_dir(second_path.parent().unwrap())
+            .unwrap()
+            .count(),
+        2,
+        "shutdown retains both complete results without staging files"
+    );
 }
 
 #[test]
@@ -147,7 +154,7 @@ fn observe_cancels_pending_wait_before_requesting_the_next_frame() {
     assert!(matches!(observe.request.request, DaemonRequest::Observe(_)));
     waiting.assert_closed();
     assert_eq!(terminal_result(&path)["status"], "cancelled");
-    assert_eq!(watcher_wake_count(&path), 0);
+    assert_eq!(watcher_wake_count(&path), 1);
     observe.respond(ResponseResult::Ok(DaemonResponse::Observe(
         mcp.image_observation("new"),
     )));
@@ -155,13 +162,15 @@ fn observe_cancels_pending_wait_before_requesting_the_next_frame() {
 
     let next_path = mcp.start_wait(7, 2);
     assert_ne!(path, next_path);
-    assert!(!path.exists());
+    assert_eq!(terminal_result(&path)["status"], "cancelled");
     mcp.daemon_call()
         .respond(ResponseResult::Ok(DaemonResponse::Wait(
             WaitOutcome::Timeout { elapsed_ms: 1 },
         )));
     assert_eq!(terminal_result(&next_path)["status"], "timeout");
     mcp.close();
+    assert_eq!(terminal_result(&path)["status"], "cancelled");
+    assert_eq!(watcher_wake_count(&path), 1);
 }
 
 #[test]
@@ -231,13 +240,13 @@ fn invalid_action_and_replay_preserve_wait_but_new_action_cancels_it() {
     );
     waiting.assert_closed();
     assert_eq!(terminal_result(&path)["status"], "cancelled");
-    assert_eq!(watcher_wake_count(&path), 0);
+    assert_eq!(watcher_wake_count(&path), 1);
     mcp.close();
 }
 
 #[test]
 #[ignore = "requires local Unix socket access"]
-fn daemon_failures_publish_error_while_stale_or_cancelled_waits_do_not_wake() {
+fn daemon_failures_publish_visible_results_including_stale_and_cancelled_waits() {
     for code in [
         ErrorCode::Busy,
         ErrorCode::InvalidAction,
@@ -256,13 +265,12 @@ fn daemon_failures_publish_error_while_stale_or_cancelled_waits_do_not_wake() {
         let result = terminal_result(&path);
         if matches!(code, ErrorCode::StaleFrame | ErrorCode::Cancelled) {
             assert_eq!(result["status"], "cancelled", "{code}");
-            assert_eq!(watcher_wake_count(&path), 0);
         } else {
             assert_eq!(result["status"], "error", "{code}");
             assert_eq!(result["code"], code.to_string());
             assert_eq!(result["message"], "mock wait failure");
-            assert_eq!(watcher_wake_count(&path), 1);
         }
+        assert_eq!(watcher_wake_count(&path), 1);
         assert!(result["elapsed_ms"].is_u64());
         mcp.close();
     }
@@ -329,7 +337,7 @@ fn polling_observes_only_complete_json_even_for_large_results() {
 
 #[test]
 #[ignore = "requires local Unix socket access"]
-fn eof_and_signals_close_pending_wait_and_remove_the_private_session() {
+fn eof_and_signals_publish_cancellation_for_a_late_monitor() {
     for signal in [
         None,
         Some(rustix::process::Signal::TERM),
@@ -347,9 +355,12 @@ fn eof_and_signals_close_pending_wait_and_remove_the_private_session() {
             mcp.close();
         }
         waiting.assert_closed();
-        assert!(
-            !path.parent().unwrap().exists(),
-            "shutdown removes the entire session"
+        assert_eq!(terminal_result(&path)["status"], "cancelled");
+        assert_eq!(watcher_wake_count(&path), 1);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "shutdown retains cancellation without staging files"
         );
     }
 }
@@ -365,10 +376,12 @@ fn shutdown_does_not_wait_for_an_observe_holding_the_frame_state_lock() {
     let observing = mcp.daemon_call();
     waiting.assert_closed();
     assert_eq!(terminal_result(&path)["status"], "cancelled");
+    let cancelled = std::fs::read(&path).unwrap();
     mcp.signal(rustix::process::Signal::TERM);
     mcp.wait_for_exit();
     observing.assert_closed();
-    assert!(!path.parent().unwrap().exists());
+    assert_eq!(std::fs::read(&path).unwrap(), cancelled);
+    assert_eq!(watcher_wake_count(&path), 1);
 }
 
 #[test]
@@ -399,10 +412,10 @@ fn eof_closes_async_publication_before_draining_a_pending_synchronous_wait() {
             .expect("EOF promptly closes the async daemon connection"),
         0
     );
-    while path.parent().unwrap().exists() {
+    while !path.exists() {
         assert!(
             Instant::now() < deadline,
-            "EOF cleanup must precede rmcp's five-second handler drain"
+            "EOF cancellation must precede rmcp's five-second handler drain"
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -410,6 +423,8 @@ fn eof_closes_async_publication_before_draining_a_pending_synchronous_wait() {
         Instant::now() < deadline,
         "async cancellation exceeded two seconds"
     );
+    assert_eq!(terminal_result(&path)["status"], "cancelled");
+    let cancelled = std::fs::read(&path).unwrap();
 
     // Arrange a terminal reply only after the transport's shutdown barrier.
     let late_response = ResponseEnvelope {
@@ -424,16 +439,11 @@ fn eof_closes_async_publication_before_draining_a_pending_synchronous_wait() {
         )
         .is_err()
     );
-    assert!(
-        !path.exists(),
-        "cancelled wait cannot publish a wake-up file"
-    );
+    assert_eq!(std::fs::read(&path).unwrap(), cancelled);
     mcp.wait_for_exit();
     synchronous.assert_closed();
-    assert!(
-        !path.parent().unwrap().exists(),
-        "no late publication may recreate the session"
-    );
+    assert_eq!(std::fs::read(&path).unwrap(), cancelled);
+    assert_eq!(watcher_wake_count(&path), 1);
 }
 
 #[test]
@@ -753,6 +763,6 @@ fn terminal_result(path: &Path) -> Value {
 fn watcher_wake_count(path: &Path) -> usize {
     usize::from(matches!(
         terminal_result(path)["status"].as_str(),
-        Some("changed" | "timeout" | "error")
+        Some("changed" | "timeout" | "error" | "cancelled")
     ))
 }

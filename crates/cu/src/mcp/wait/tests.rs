@@ -77,7 +77,7 @@ fn result(path: &Path) -> Value {
 async fn completion_before_cancellation_preserves_the_only_terminal_result() {
     let root = tempfile::tempdir().unwrap();
     let waits = manager(root.path());
-    let _owner = waits.owner();
+    let owner = waits.owner();
     let (release, ready) = oneshot::channel();
     let (path, finished) = register(&waits, "baseline", |guard| async move {
         received(ready).await;
@@ -90,6 +90,8 @@ async fn completion_before_cancellation_preserves_the_only_terminal_result() {
     waits.cancel().await;
     late.finish(&SignalResult::Cancelled { elapsed_ms: 43 });
     drop(late);
+    owner.shutdown().await;
+    drop(owner);
     assert_eq!(result(&path)["status"], "timeout");
     assert_eq!(fs::read(&path).unwrap(), published);
     assert!(lock(&waits.control).pending.is_none());
@@ -97,7 +99,7 @@ async fn completion_before_cancellation_preserves_the_only_terminal_result() {
 }
 
 #[tokio::test]
-async fn cancellation_before_completion_remains_silent_and_is_not_overwritten() {
+async fn cancellation_before_completion_stays_visible_and_is_not_overwritten() {
     let root = tempfile::tempdir().unwrap();
     let waits = manager(root.path());
     let _owner = waits.owner();
@@ -147,17 +149,18 @@ async fn old_worker_completion_and_drop_cannot_finish_a_new_generation() {
         generation
     );
     assert!(!path.exists());
-    assert!(!old_path.exists());
+    assert_eq!(result(&old_path)["status"], "cancelled");
 
     release.send(()).unwrap();
     received(finished).await;
     assert_eq!(result(&path)["status"], "timeout");
     assert_eq!(result(&path)["elapsed_ms"], 45);
+    assert_eq!(result(&old_path)["status"], "cancelled");
     assert!(lock(&waits.control).pending.is_none());
 }
 
 #[tokio::test]
-async fn shutdown_and_drop_clean_up_even_while_the_frame_mutex_is_held() {
+async fn shutdown_and_drop_publish_cancellation_even_while_the_frame_mutex_is_held() {
     for explicit_shutdown in [true, false] {
         let root = tempfile::tempdir().unwrap();
         let waits = manager(root.path());
@@ -181,14 +184,13 @@ async fn shutdown_and_drop_clean_up_even_while_the_frame_mutex_is_held() {
         }
         drop(owner);
         received(finished).await;
-        assert!(!session.exists());
+        assert_eq!(result(&path)["status"], "cancelled");
+        let published = fs::read(&path).unwrap();
         drop(held);
         late.finish(&SignalResult::Timeout { elapsed_ms: 3 });
         drop(late);
-        assert!(
-            !session.exists(),
-            "a late completion recreated the session directory"
-        );
+        assert_eq!(fs::read(&path).unwrap(), published);
+        assert_eq!(fs::read_dir(&session).unwrap().count(), 1);
         let control = lock(&waits.control);
         assert!(control.closed);
         assert!(control.pending.is_none());
@@ -214,27 +216,33 @@ async fn panicking_worker_publishes_an_error_and_releases_the_pending_slot() {
         guard.finish(&SignalResult::Timeout { elapsed_ms: 0 });
     });
     received(next_finished).await;
-    assert!(!path.exists());
+    assert_eq!(result(&path), failed);
     assert_eq!(result(&next_path)["status"], "timeout");
 }
 
 #[tokio::test]
-async fn cancelling_an_unpolled_worker_drops_its_guard_without_a_false_error() {
-    let root = tempfile::tempdir().unwrap();
-    let waits = manager(root.path());
-    let _owner = waits.owner();
-    let was_polled = Arc::new(AtomicBool::new(false));
-    let worker_polled = Arc::clone(&was_polled);
-    let (path, finished) = register(&waits, "baseline", |guard| async move {
-        worker_polled.store(true, Ordering::SeqCst);
-        guard.finish(&SignalResult::error(0, "internal", "should never run"));
-    });
-    // The single-thread runtime has not yielded since spawning the worker.
-    waits.cancel().await;
-    received(finished).await;
-    assert!(!was_polled.load(Ordering::SeqCst));
-    assert_eq!(result(&path)["status"], "cancelled");
-    assert!(lock(&waits.control).pending.is_none());
+async fn cancelling_or_stopping_an_unpolled_worker_publishes_without_a_false_error() {
+    for shutdown in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let waits = manager(root.path());
+        let owner = waits.owner();
+        let was_polled = Arc::new(AtomicBool::new(false));
+        let worker_polled = Arc::clone(&was_polled);
+        let (path, finished) = register(&waits, "baseline", |guard| async move {
+            worker_polled.store(true, Ordering::SeqCst);
+            guard.finish(&SignalResult::error(0, "internal", "should never run"));
+        });
+        // The single-thread runtime has not yielded since spawning the worker.
+        if shutdown {
+            owner.shutdown().await;
+        } else {
+            waits.cancel().await;
+        }
+        received(finished).await;
+        assert!(!was_polled.load(Ordering::SeqCst));
+        assert_eq!(result(&path)["status"], "cancelled");
+        assert!(lock(&waits.control).pending.is_none());
+    }
 }
 
 #[tokio::test]
@@ -285,7 +293,7 @@ async fn post_act_cancellation_requires_a_different_committed_frame() {
 }
 
 #[tokio::test]
-async fn late_detector_wakes_once_for_completion_and_never_for_cancellation() {
+async fn late_detector_after_shutdown_wakes_once_for_every_terminal_status() {
     // A minimal external detector consumes one terminal JSON, then exits. The
     // callback counts wake-ups without invoking a shell or an actual queue.
     struct Detector {
@@ -299,13 +307,12 @@ async fn late_detector_wakes_once_for_completion_and_never_for_cancellation() {
                 return;
             }
             let terminal = result(path);
-            match terminal["status"].as_str() {
-                Some("changed" | "timeout" | "error") => {
-                    self.wakes += 1;
-                    self.stopped = true;
-                }
-                Some("cancelled") => self.stopped = true,
-                _ => {}
+            if matches!(
+                terminal["status"].as_str(),
+                Some("changed" | "timeout" | "error" | "cancelled")
+            ) {
+                self.wakes += 1;
+                self.stopped = true;
             }
         }
     }
@@ -326,14 +333,16 @@ async fn late_detector_wakes_once_for_completion_and_never_for_cancellation() {
         SignalResult::Cancelled { elapsed_ms: 8 },
     ];
     for terminal in results {
-        let expected_wakes = usize::from(!matches!(terminal, SignalResult::Cancelled { .. }));
         let root = tempfile::tempdir().unwrap();
         let waits = manager(root.path());
-        let _owner = waits.owner();
+        let owner = waits.owner();
         let (path, finished) = register(&waits, "baseline", |guard| async move {
             guard.finish(&terminal);
         });
         received(finished).await;
+        owner.shutdown().await;
+        drop(owner);
+        drop(waits);
         let mut detector = Detector {
             stopped: false,
             wakes: 0,
@@ -341,6 +350,6 @@ async fn late_detector_wakes_once_for_completion_and_never_for_cancellation() {
         detector.poll(&path);
         detector.poll(&path);
         assert!(detector.stopped);
-        assert_eq!(detector.wakes, expected_wakes);
+        assert_eq!(detector.wakes, 1);
     }
 }

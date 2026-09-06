@@ -21,10 +21,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum McpWaitStarted {
-    Started {
-        /// Private terminal JSON path. Read its status before waking; cancelled is silent.
-        signal_path: String,
-    },
+    Started { signal_path: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -249,10 +246,9 @@ impl AsyncWaits {
             return;
         }
         control.closed = true;
-        control.stopped_task = control.pending.take().map(|pending| {
-            pending.task.abort();
-            pending.task
-        });
+        // Publish cancellation before closing storage, even when the client is
+        // gone. The result outlives this MCP process for a late monitor.
+        control.stopped_task = control.cancel();
         control.store.cleanup();
     }
 

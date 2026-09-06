@@ -36,7 +36,7 @@ use uuid::Uuid;
 use crate::client;
 use wait::{AsyncWaits, McpWaitStarted};
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. computer_wait blocks by default; async:true returns a private signal_path for terminal JSON. For longer waits, prefer async:true with an available monitor tool: the completed JSON is a Bash-visible condition. Arm the monitor, then do unrelated work or end the turn until notified. The monitor may wake on changed, timeout, or error; cancelled must stay silent. After a wake, call computer_observe for a fresh screenshot. Observe cancels a pending async wait. Async waits belong to this MCP process and end when it exits. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
 const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
@@ -76,7 +76,7 @@ struct McpWaitRequest {
     #[serde(default = "default_wait_quiet_ms")]
     #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
-    /// Return a `signal_path` immediately instead of blocking. Read terminal JSON status; cancelled is silent.
+    /// Return signal_path immediately. Use a monitor to notify when the file appears which indicates completion. Observe cancels pending waits; observe again after notification.
     #[serde(default, rename = "async")]
     async_mode: bool,
 }
@@ -488,7 +488,7 @@ impl ComputerUseMcp {
     }
 
     #[tool(
-        description = "Wait for an expected GUI change. Blocks by default, returning a PNG on change. For longer waits, prefer async:true with an available monitor tool. It returns signal_path immediately; terminal JSON there provides a Bash-visible completion condition. Arm the monitor, then do unrelated work or idle until notified. Wake on changed, timeout, or error; cancelled stays silent. Observe cancels a pending async wait; observe again after waking. If changes repeat quickly, narrow or exclude noisy regions.",
+        description = "Wait for a change in selected screen regions. Blocks by default; prefer async:true for background monitoring. If changes repeat quickly, narrow or exclude noisy regions.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<McpWaitReply>(),
         annotations(
             title = "Wait for computer change",

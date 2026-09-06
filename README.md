@@ -243,19 +243,23 @@ The private final JSON file appears atomically, with one terminal status:
 | `changed` | `elapsed_ms`, `activity_bbox`, `settled` | Wake once |
 | `timeout` | `elapsed_ms` | Wake once |
 | `error` | `elapsed_ms`, `code`, `message` | Wake once |
-| `cancelled` | `elapsed_ms` | Exit silently |
+| `cancelled` | `elapsed_ms` | Wake once |
 
-Read the status before waking: file existence alone also detects cancellation.
+Notify once when the result file appears, including for `cancelled`. Cancellation
+ends the wait and must remain visible to a monitor that is still armed. Read the
+JSON status to distinguish cancellation, timeout, errors, and detected activity.
 Check immediately, then poll once per second with a bounded detector lifetime.
 An event-based detector must register a watch on the containing directory
 **before** checking for an existing file, so completion during setup is not lost.
-Exit silently if the session directory disappears or the detector's own deadline
-expires without a result. Never notify from an exit or cleanup handler. A wait
-timeout is a published `timeout` result; a detector deadline is not proof that
-the wait completed. cu neither executes callbacks nor calls Codex; an external
-watcher such as `monitor-wakeup` owns any continuation.
+If the session directory disappears or the detector's deadline expires without
+a result, notify once that monitoring failed. A detector deadline is not proof
+that the wait completed. Notify from these explicit branches; stopping the
+monitor itself should not trigger an exit-handler notification. cu neither
+executes callbacks nor calls Codex; an external watcher such as `monitor-wakeup`
+owns any continuation.
 
-After waking, call `computer_observe` for a fresh screenshot and frame. The file
+After waking, read the result and call `computer_observe` for a fresh screenshot
+and frame. Remove the result file after handling it. The file
 contains notification metadata only, without a frame number or image path.
 Changed results clear the old MCP frame binding; unchanged timeouts preserve it.
 If completion wins the race with cancellation, its published result remains;
@@ -263,13 +267,16 @@ an already-issued wake-up cannot be withdrawn.
 
 Paths are unique per wait under
 `$XDG_RUNTIME_DIR/computer-use/mcp-waits/<session>/<wait>.json`, using the usual
-`/run/user/<uid>` fallback. Directories are `0700` and files `0600`. Each MCP
-process retains at most its latest result, deleting it on the next accepted
-async start. MCP EOF, SIGTERM, or SIGINT cancels the worker and removes its private
-session directory. Daemon loss while MCP remains alive produces `error`.
-SIGKILL or a crash cannot guarantee cleanup or a terminal file; remaining files
-last until runtime-directory cleanup. A publication failure is logged, releases
-the task, and leaves no partial final JSON; the detector's bound covers it.
+`/run/user/<uid>` fallback. Directories are `0700` and files `0600`. Published
+results survive new waits and MCP process exit so late monitors can read them.
+Consumers remove handled files; unread files and nonempty session directories
+remain until runtime-directory cleanup. There is no automatic result eviction
+or retention cap. MCP EOF, SIGTERM, or SIGINT publishes `cancelled` for a pending
+wait, stops its worker, and removes an empty session directory. A previously
+published terminal result is preserved. Daemon loss while MCP remains alive
+produces `error`. SIGKILL or a crash cannot guarantee cleanup or a terminal file.
+A publication failure is logged, releases the task, and leaves no partial final
+JSON; the monitor's deadline makes a missing result visible.
 
 Repeated changed results with unexpectedly small `elapsed_ms` indicate an
 active included region. Narrow the includes or exclude blinking cursors and
