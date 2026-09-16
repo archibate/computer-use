@@ -314,7 +314,7 @@ impl Observation {
 pub enum ActStatus {
     /// Every action executed and the returned observation is the resulting state.
     Ok,
-    /// Only `executed` leading actions ran; inspect `action_error` and the returned observation.
+    /// Only `executed` leading actions completed before an input failure.
     Partial,
 }
 

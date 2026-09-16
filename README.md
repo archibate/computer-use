@@ -23,6 +23,13 @@ cargo build --release -p cu
 The examples below assume `~/.local/bin` is on `PATH`. For a copied installation
 instead, run `cargo install --locked --path crates/cu --root "$HOME/.local" --force`.
 
+For an agent-owned offscreen desktop, install `Xvfb` and `openbox` on `PATH`,
+register `cu mcp` as described below, then call
+`computer_connect({"type":"private"})`. cu starts and owns the Xvfb/Openbox
+desktop; no systemd configuration or separately started daemon is needed.
+
+To connect to an existing desktop instead, start a daemon:
+
 ```sh
 # Detect the current desktop session
 cu daemon
@@ -43,21 +50,21 @@ Wayland session selects the direct Wayland backend even when XWayland also sets
 automatic mode, while `--output` selects direct Wayland. `--max-width` and
 `--max-height` add optional downscaling limits for either backend.
 
-MCP initialization includes connection metadata from the daemon's active backend:
+`computer_connect` returns a profile with metadata from the daemon's active backend:
 X11 display and screen (for example, `backend=x11, display=":99", screen=0`), or
 the absolute Wayland socket path and selected output. Wayland also includes
 `x11_display` when the daemon's `DISPLAY` is set; this is an environment hint,
 not a verified association with the same compositor. An inherited `WAYLAND_SOCKET`
 connection is identified as `connection=inherited_fd` instead of a socket path.
-This metadata is included even without `--profile`; it is sent once in
-initialization instructions, not in per-frame tool responses.
+This metadata is included even without `--profile`; it is returned on each
+connection, not in per-frame tool responses.
 
 `--profile` loads a trusted UTF-8 Markdown or text file of at most 16 KiB and
 appends it after the connection metadata. This keeps desktop-specific operating
 guidance, such as verified window-manager shortcuts, out of the generic tool
 schemas. After changing the daemon target or profile, restart the daemon and
-reconnect MCP to refresh both. If the daemon is unavailable when MCP starts,
-that connection keeps the generic instructions until it reconnects.
+call `computer_connect` again to refresh both. A failed connection leaves MCP
+disconnected; it never falls back to another desktop.
 
 | Desktop session | Backend | Status |
 | --- | --- | --- |
@@ -94,8 +101,8 @@ files, although MCP does not expose the local path. An `image_path` remains
 usable only while its PNG is retained; its `frame_id` is actionable only until
 that daemon instance returns a newer frame.
 
-For an isolated `:99` desktop, install Xvfb and the bundled user units after
-`scripts/install-dev`:
+For a persistent, externally managed `:99` Xvfb server, the bundled systemd
+units remain an optional alternative after `scripts/install-dev`:
 
 ```sh
 install -Dm644 systemd/cu-display.service \
@@ -167,8 +174,7 @@ Dropping the CLI process cancels its daemon wait.
 
 ## MCP
 
-Start `cu daemon` separately, then register the local stdio MCP server with one
-of these commands.
+Register the local stdio MCP server with one of these commands.
 
 Codex:
 
@@ -182,8 +188,12 @@ Claude Code (user scope, available across projects):
 claude mcp add --scope user --transport stdio cu -- cu mcp
 ```
 
-It exposes three tools:
+It exposes four tools:
 
+- `computer_connect` requires `type` (`private`, `default`, or `named`) and
+  returns `{instance, profile}`. `private` creates or reuses this MCP process's
+  desktop; `default` selects the default daemon; `named` requires `name` to
+  select an existing named daemon.
 - `computer_observe` returns a session-local integer `frame`, dimensions,
   settling status, and a PNG image.
 - `computer_act` requires that latest `frame`, executes a validated batch, and
@@ -194,10 +204,44 @@ It exposes three tools:
   `activity_bbox`. Optional `async:true` returns a completion-file path instead.
 
 The published schemas describe every action, coordinate and key convention,
-settling limits, partial execution, and stale-frame recovery.
+and settling limits. Recovery guidance arrives with the result that needs it:
+errors include a diagnostic and applicable next steps, while partial or screenshot-expired
+action results include a `message`. Ordinary successful action results omit it.
+
+MCP starts disconnected. Call `computer_connect` before observing, acting, or
+waiting; otherwise these tools return `not_connected`. The three request forms
+are `{"type":"private"}`, `{"type":"default"}`, and
+`{"type":"named","name":"work"}`. Only `named` accepts `name`, which must be
+a valid nonempty instance name. Names `default` and `private` are also allowed:
+`{"type":"named","name":"default"}` selects `instances/default`, independently
+of `{"type":"default"}`. Unknown fields and the old `{"instance":"..."}`
+request shape are rejected. The returned `instance` is the target label
+(`private`, `default`, or its name); interpret it together with the request's `type`.
+
+Find candidate named instances with:
+
+```sh
+ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances"
+```
+
+Directories may remain after a daemon exits; connecting checks availability.
+There is no separate instance registry or list command. `cu mcp --instance`
+and `cu mcp --socket` have been removed; select the instance through the tool.
+CLI commands still support their daemon targeting options. Omit `--instance`
+for the default daemon; an explicit `--instance NAME` always selects
+`instances/NAME`, including names `default` and `private`. Existing commands
+using `--instance default` for the default daemon should omit that option.
+
+Every valid connect attempt cancels this MCP's synchronous and asynchronous
+waits, clears its current frame and action retry cache, and requires a fresh
+observe, even when reconnecting to the same instance. Connect itself does not
+capture a frame or alter the public daemon's current frame. Connection failure,
+or cancellation detected during connection, leaves the MCP disconnected. A
+completed connection is not undone by a late cancellation.
 
 MCP frame numbers start at 1, increase for each distinct observation, and are
-valid only within that MCP process. The adapter maps them to the daemon's opaque
+never reset when switching instances within that MCP process. Frames from a
+previous connection are invalid. The adapter maps them to the daemon's opaque
 frame IDs, which remain part of the CLI and daemon protocols but are not exposed
 to the agent. Re-arm an unchanged timeout with the same frame; use the fresh
 frame after a changed result. Call `computer_observe` after `stale_frame`,
@@ -216,6 +260,30 @@ args = ["mcp"]
 tool_timeout_sec = 100000
 ```
 
+### Private desktops
+
+Each MCP process owns at most one private desktop: a 1280×800 Xvfb screen with
+one Openbox workspace. Xvfb allocates an available display automatically, uses
+a private Xauthority cookie, and disables TCP listening. Openbox loads the
+built-in configuration without the user's autostart. Its shortcuts and the
+display/authentication environment needed to launch applications are returned
+in the connection profile. cu does not add a panel or VNC server.
+
+Switching away preserves the desktop and its windows. Reconnecting to `private`
+reuses it, or recreates it after a crash. MCP EOF, termination, or death stops
+its private worker, Xvfb, and Openbox. Loss of either desktop component stops
+the worker; call `computer_connect` again to recreate it. Startup failure,
+timeout, and cancellation roll back a newly created desktop.
+
+Private resources live under
+`${XDG_RUNTIME_DIR:-/run/user/<uid>}/computer-use/mcp-desktops/<uuid>`, with
+owner-only directories and files. Normal shutdown removes that desktop's
+resources; forcibly killing its worker can leave runtime files until the next
+connect or MCP exit. This is desktop isolation under the same Linux user, not
+a container: applications share the user's files and accounts and may have
+their own single-instance behavior. cu does not guarantee termination of
+applications launched independently from an external shell.
+
 ### Asynchronous MCP waits
 
 For longer waits, prefer async mode with a monitor tool when one is available.
@@ -231,7 +299,8 @@ Pass `"async":true` with the same frame, regions, and timing parameters:
 {"frame":1,"include_rects":[{"x":780,"y":120,"width":800,"height":720}],"async":true}
 ```
 
-The tool immediately returns `{"status":"started","signal_path":"..."}`.
+The tool immediately returns `{"status":"started","signal_path":"...","message":"..."}`
+with instructions to monitor the file and read its result.
 This means the MCP process accepted the background task; daemon rejection
 (including `busy`), connection failure, or invalid regions can arrive in the
 result file. Omitting `async` or setting it to `false` preserves the blocking
@@ -242,16 +311,18 @@ There is still one active wait per daemon, and a second pending async wait in
 the same MCP process returns `busy`. `computer_observe` cancels a pending async
 wait before requesting its screenshot. A new action that commits a new frame
 also cancels it; validation failures and cached action replays do not. Other
-clients' baseline supersession produces `cancelled`. There is no cancel tool.
+clients' baseline supersession produces `cancelled`. `computer_connect` also
+cancels pending waits, including when the daemon frame has not changed. There
+is no cancel tool.
 
 The private final JSON file appears atomically, with one terminal status:
 
 | Status | Additional fields | External watcher |
 | --- | --- | --- |
-| `changed` | `elapsed_ms`, `activity_bbox`, `settled` | Wake once |
+| `changed` | `elapsed_ms`, `activity_bbox`, `settled`, `message` | Wake once |
 | `timeout` | `elapsed_ms` | Wake once |
 | `error` | `elapsed_ms`, `code`, `message` | Wake once |
-| `cancelled` | `elapsed_ms` | Wake once |
+| `cancelled` | `elapsed_ms`, `message` | Wake once |
 
 Notify once when the result file appears, including for `cancelled`. Cancellation
 ends the wait and must remain visible to a monitor that is still armed. Read the
@@ -293,7 +364,7 @@ unrelated animation before re-arming.
 The engine rejects stale frames before input, validates the complete batch
 before its first side effect, executes actions in order, and captures state
 after success or partial execution. Reusing a CLI `--request-id`, or retrying
-the same MCP request within one MCP session, returns the cached action result
+the same MCP request within one connection, returns the cached action result
 instead of executing twice. This idempotency cache does not survive a daemon
 restart. If a cached result outlives its retained PNG, it returns
 `image_expired: true` without an image; the action has already executed and the

@@ -31,15 +31,72 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{sync::Mutex, time::MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::client;
+use crate::{client, desktop::PrivateDesktop};
 use wait::{AsyncWaits, McpWaitStarted};
 
-const MCP_INSTRUCTIONS: &str = "Use computer_observe before the first action and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. Batch actions only when no intermediate inspection is needed. After stale_frame, cancellation, viewport_changed, or image_expired, observe again. After partial execution, inspect the returned observation before continuing. Apply your authorization policy before consequential UI actions.";
+const MCP_INSTRUCTIONS: &str = "Call computer_connect to select a desktop before using other tools. Use computer_observe before the first action, after connecting, and whenever the current screenshot is unknown. Pass the latest returned frame number to computer_act.frame or computer_wait.frame; x and y are integer pixels in [0,width) and [0,height). computer_act affects the live desktop and returns a fresh observation. Batch actions only when no intermediate inspection is needed. Apply your authorization policy before consequential UI actions.";
 const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(extend("type" = "object"))]
+enum McpConnectRequest {
+    /// Create or reuse this MCP process's offscreen Xvfb/Openbox desktop.
+    /// Switching away preserves it until this MCP exits.
+    Private {},
+    /// Connect to the existing default daemon.
+    Default {},
+    /// Connect to an existing named daemon.
+    Named {
+        /// Instance directory name.
+        /// Find candidate names with: ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances".
+        #[serde(deserialize_with = "deserialize_named_instance")]
+        #[schemars(
+            with = "String",
+            length(min = 1, max = 64),
+            regex(pattern = "^[A-Za-z0-9_.-]+$")
+        )]
+        name: crate::InstanceName,
+    },
+}
+
+fn deserialize_named_instance<'de, D>(deserializer: D) -> Result<crate::InstanceName, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    name.parse().map_err(serde::de::Error::custom)
+}
+
+impl McpConnectRequest {
+    fn instance(&self) -> &str {
+        match self {
+            Self::Private {} => "private",
+            Self::Default {} => "default",
+            Self::Named { name } => &name.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct McpConnection {
+    instance: String,
+    /// Connection details and trusted operating guidance for this desktop.
+    profile: String,
+}
+
+#[derive(Debug, Clone)]
+struct Connection {
+    socket: PathBuf,
+    target: McpConnectRequest,
+    generation: Uuid,
+    cancelled: CancellationToken,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[schemars(title = "computer action input")]
@@ -76,7 +133,7 @@ struct McpWaitRequest {
     #[serde(default = "default_wait_quiet_ms")]
     #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
-    /// Return `signal_path` immediately. Use a monitor to notify when the file appears which indicates completion. Observe cancels pending waits; observe again after notification.
+    /// Return `signal_path` immediately for background monitoring. Observe cancels pending waits.
     #[serde(default, rename = "async")]
     async_mode: bool,
 }
@@ -147,6 +204,7 @@ enum McpWaitReply {
 #[derive(Debug, Serialize, JsonSchema)]
 struct McpActionError {
     /// Stable error category.
+    #[schemars(with = "String")]
     code: ErrorCode,
     /// Human-readable diagnostic and recovery context.
     message: String,
@@ -175,12 +233,15 @@ struct McpActOutcome {
     /// Failure that stopped a partial batch; absent when status is `ok`.
     #[serde(skip_serializing_if = "Option::is_none")]
     action_error: Option<McpActionError>,
-    /// True only when a cached replay outlived its screenshot; observe again without repeating it.
+    /// Whether the cached result's screenshot has expired.
     #[serde(default, skip_serializing_if = "is_false")]
     image_expired: bool,
     /// Fresh post-action or post-failure frame, absent only when `image_expired` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     observation: Option<McpObservation>,
+    /// Guidance specific to this result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -203,6 +264,17 @@ impl McpActOutcome {
             action_error: action_error.map(|error| McpActionError::from_protocol(error, executed)),
             image_expired,
             observation,
+            message: if image_expired {
+                Some(
+                    "This is a cached action result; the action was not repeated. Call computer_observe for a current screenshot before continuing; do not repeat completed actions.",
+                )
+            } else if status == ActStatus::Partial {
+                Some(
+                    "Inspect the returned observation before continuing; do not repeat completed actions.",
+                )
+            } else {
+                None
+            },
         }
     }
 }
@@ -222,6 +294,7 @@ struct CachedMcpAction {
 
 #[derive(Debug, Default)]
 struct McpSessionState {
+    connection: Option<Connection>,
     latest_frame: u64,
     current: Option<FrameBinding>,
     completed_actions: HashMap<String, CachedMcpAction>,
@@ -229,6 +302,15 @@ struct McpSessionState {
 }
 
 impl McpSessionState {
+    fn disconnect(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.cancelled.cancel();
+        }
+        self.current = None;
+        self.completed_actions.clear();
+        self.cache_order.clear();
+    }
+
     fn resolve_frame(&self, frame: u64) -> Result<FrameBinding, CuError> {
         if frame == 0 {
             return Err(CuError::new(
@@ -391,30 +473,112 @@ fn wait_error_invalidates_frame(code: ErrorCode) -> bool {
 
 #[derive(Clone)]
 pub struct ComputerUseMcp {
-    socket: PathBuf,
-    instructions: String,
     session_id: Uuid,
     state: Arc<Mutex<McpSessionState>>,
     waits: AsyncWaits,
+    desktop: PrivateDesktop,
+    shutdown: CancellationToken,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl ComputerUseMcp {
-    pub fn new(socket: PathBuf, profile: Option<&str>) -> Self {
+    pub fn new() -> Self {
         let session_id = Uuid::new_v4();
         Self {
-            socket,
-            instructions: compose_instructions(profile),
             session_id,
             state: Arc::new(Mutex::new(McpSessionState::default())),
             waits: AsyncWaits::new(crate::default_runtime_dir(), session_id),
+            desktop: PrivateDesktop::default(),
+            shutdown: CancellationToken::new(),
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(
-        description = "Capture the current desktop after optional visual settling. Returns a session-local frame number, image dimensions, settling status, and a PNG. Call before the first action, after stale_frame, or whenever UI state is uncertain.",
+        description = "Connect to a desktop. Every valid connection attempt cancels pending waits and invalidates previous frames; call computer_observe afterward.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<McpConnection>(),
+        annotations(title = "Connect computer", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn computer_connect(
+        &self,
+        Parameters(request): Parameters<McpConnectRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let private = matches!(&request, McpConnectRequest::Private {});
+        let mut state = self.state.lock().await;
+        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+            return Ok(cancelled_connect_result());
+        }
+        state.disconnect();
+        self.waits.cancel().await;
+        let (socket, created) = match &request {
+            McpConnectRequest::Default {} => (crate::default_runtime_dir().join("cu.sock"), false),
+            McpConnectRequest::Named { name } => {
+                (crate::named_instance_dir(name).join("cu.sock"), false)
+            }
+            McpConnectRequest::Private {} => match self.desktop.launch() {
+                Ok(result) => result,
+                Err(error) => return Ok(connection_error(&request, &error)),
+            },
+        };
+        let connecting = async {
+            if !private {
+                return tokio::time::timeout(PROFILE_FETCH_TIMEOUT, fetch_profile(&socket))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("daemon profile request timed out"))?;
+            }
+            tokio::time::timeout(crate::desktop::START_TIMEOUT + PROFILE_FETCH_TIMEOUT, async {
+                loop {
+                    if !self.desktop.running()? {
+                        anyhow::bail!("private desktop stopped; check that Xvfb and Openbox are installed, then call computer_connect again");
+                    }
+                    match tokio::time::timeout(PROFILE_FETCH_TIMEOUT, fetch_profile(&socket)).await {
+                        Ok(Ok(profile)) => return Ok(profile),
+                        Ok(Err(_)) if created => tokio::time::sleep(Duration::from_millis(20)).await,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => anyhow::bail!("private desktop profile request timed out"),
+                    }
+                }
+            }).await.map_err(|_| anyhow::anyhow!("private desktop startup timed out"))?
+        };
+        let result = tokio::select! {
+            biased;
+            () = context.ct.cancelled() => Err(anyhow::anyhow!("connection cancelled")),
+            () = self.shutdown.cancelled() => Err(anyhow::anyhow!("MCP session is closing")),
+            result = connecting => result,
+        };
+        match result {
+            Ok(profile) if !context.ct.is_cancelled() && !self.shutdown.is_cancelled() => {
+                state.connection = Some(Connection {
+                    socket,
+                    target: request.clone(),
+                    generation: Uuid::new_v4(),
+                    cancelled: self.shutdown.child_token(),
+                });
+                Ok(structured_result(McpConnection {
+                    instance: request.instance().to_owned(),
+                    profile: profile.unwrap_or_default(),
+                }))
+            }
+            result => {
+                if created {
+                    self.desktop.reset().await;
+                }
+                if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+                    Ok(cancelled_connect_result())
+                } else {
+                    Ok(connection_error(
+                        &request,
+                        &result.expect_err("successful connection handled above"),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Capture the current desktop after optional visual settling. Returns a session-local frame number, image dimensions, settling status, and a PNG. Call before the first action or whenever UI state is uncertain.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<McpObservation>(),
         annotations(
             title = "Observe computer",
@@ -433,12 +597,20 @@ impl ComputerUseMcp {
             return Ok(cancelled_result());
         }
         let mut state = self.state.lock().await;
+        let connection = match connected(&state) {
+            Ok(connection) => connection,
+            Err(result) => return Ok(result),
+        };
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
         self.waits.cancel().await;
         let response = match self
-            .request_daemon(Uuid::new_v4().to_string(), DaemonRequest::Observe(request))
+            .request_daemon(
+                &connection,
+                Uuid::new_v4().to_string(),
+                DaemonRequest::Observe(request),
+            )
             .await
         {
             Ok(response) => response,
@@ -506,10 +678,14 @@ impl ComputerUseMcp {
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
-        let baseline = {
+        let (baseline, connection) = {
             let state = self.state.lock().await;
+            let connection = match connected(&state) {
+                Ok(connection) => connection,
+                Err(result) => return Ok(result),
+            };
             match state.resolve_frame(request.frame) {
-                Ok(binding) => binding,
+                Ok(binding) => (binding, connection),
                 Err(error) => return Ok(structured_error(&error)),
             }
         };
@@ -522,10 +698,13 @@ impl ComputerUseMcp {
         };
         if request.async_mode {
             return self
-                .start_async_wait(protocol_request, baseline, &context)
+                .start_async_wait(protocol_request, baseline, &connection, &context)
                 .await;
         }
-        let response = match self.request_wait_daemon(protocol_request, &context).await {
+        let response = match self
+            .request_wait_daemon(&connection, protocol_request, &context)
+            .await
+        {
             Ok(response) => response,
             Err(result) => {
                 self.state.lock().await.clear_if_current(&baseline);
@@ -581,8 +760,12 @@ impl ComputerUseMcp {
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
-        let request_id = self.action_request_id(&request_id);
         let mut state = self.state.lock().await;
+        let connection = match connected(&state) {
+            Ok(connection) => connection,
+            Err(result) => return Ok(result),
+        };
+        let request_id = self.action_request_id(&request_id, connection.generation);
         if context.ct.is_cancelled() {
             return Ok(cancelled_result());
         }
@@ -595,7 +778,11 @@ impl ComputerUseMcp {
             }
         };
         let response = match self
-            .request_daemon(request_id.clone(), DaemonRequest::Act(protocol_request))
+            .request_daemon(
+                &connection,
+                request_id.clone(),
+                DaemonRequest::Act(protocol_request),
+            )
             .await
         {
             Ok(response) => response,
@@ -631,7 +818,8 @@ impl ComputerUseMcp {
                     state.clear();
                     return Ok(CallToolResult::structured_error(json!({
                         "code": "internal",
-                        "message": "action result omitted its observation",
+                        "message": "action result omitted its observation; call computer_observe and inspect the desktop before continuing; do not repeat completed actions",
+                        "executed": outcome.executed,
                     })));
                 };
                 let binding = match state
@@ -672,23 +860,29 @@ impl ComputerUseMcp {
 
     async fn request_daemon(
         &self,
+        connection: &Connection,
         request_id: String,
         request: DaemonRequest,
     ) -> Result<ResponseEnvelope, CallToolResult> {
-        match client::request(
-            &self.socket,
-            &RequestEnvelope {
-                request_id,
-                request,
-            },
-        )
-        .await
-        {
+        let is_action = matches!(&request, DaemonRequest::Act(_));
+        let envelope = RequestEnvelope {
+            request_id,
+            request,
+        };
+        let result = tokio::select! {
+            biased;
+            () = connection.cancelled.cancelled() => return Err(cancelled_result()),
+            result = client::request(&connection.socket, &envelope) => result,
+        };
+        match result {
             Ok(response) => Ok(response),
-            Err(error) => Err(CallToolResult::structured_error(json!({
-                "code": "daemon_unavailable",
-                "message": error.to_string(),
-            }))),
+            Err(error) if is_action => Err(connection_error(
+                &connection.target,
+                &anyhow::anyhow!(
+                    "action outcome is unknown; call computer_observe and inspect the desktop before issuing more actions: {error:#}"
+                ),
+            )),
+            Err(error) => Err(connection_error(&connection.target, &error)),
         }
     }
 
@@ -696,6 +890,7 @@ impl ComputerUseMcp {
         &self,
         request: WaitRequest,
         baseline: FrameBinding,
+        connection: &Connection,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let mut state = self.state.lock().await;
@@ -706,7 +901,7 @@ impl ComputerUseMcp {
             return Ok(structured_error(&error));
         }
         let started = match self.waits.start(
-            self.socket.clone(),
+            connection.socket.clone(),
             request,
             baseline.clone(),
             Arc::clone(&self.state),
@@ -724,10 +919,15 @@ impl ComputerUseMcp {
 
     async fn request_wait_daemon(
         &self,
+        connection: &Connection,
         request: WaitRequest,
         context: &RequestContext<RoleServer>,
     ) -> Result<ResponseEnvelope, CallToolResult> {
-        let request = self.request_daemon(Uuid::new_v4().to_string(), DaemonRequest::Wait(request));
+        let request = self.request_daemon(
+            connection,
+            Uuid::new_v4().to_string(),
+            DaemonRequest::Wait(request),
+        );
         tokio::pin!(request);
         let started = tokio::time::Instant::now();
         let progress_token = context.meta.get_progress_token();
@@ -808,12 +1008,12 @@ impl ComputerUseMcp {
         }
     }
 
-    fn action_request_id(&self, request_id: &rmcp::model::RequestId) -> String {
+    fn action_request_id(&self, request_id: &rmcp::model::RequestId, generation: Uuid) -> String {
         let typed_id = match request_id {
             rmcp::model::RequestId::Number(value) => format!("n:{value}"),
             rmcp::model::RequestId::String(value) => format!("s:{value}"),
         };
-        format!("mcp:{}:{typed_id}", self.session_id)
+        format!("mcp:{}:{generation}:{typed_id}", self.session_id)
     }
 }
 
@@ -826,7 +1026,7 @@ impl ServerHandler for ComputerUseMcp {
                     .with_title("cu computer use")
                     .with_description("Frame-grounded control of a local Linux desktop"),
             )
-            .with_instructions(self.instructions.clone())
+            .with_instructions(MCP_INSTRUCTIONS)
     }
 
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
@@ -834,25 +1034,17 @@ impl ServerHandler for ComputerUseMcp {
     }
 }
 
-pub async fn serve(socket: PathBuf) -> anyhow::Result<()> {
-    let profile = match tokio::time::timeout(PROFILE_FETCH_TIMEOUT, fetch_profile(&socket)).await {
-        Ok(Ok(profile)) => profile,
-        Ok(Err(error)) => {
-            eprintln!("desktop profile unavailable; using generic MCP instructions: {error:#}");
-            None
-        }
-        Err(_) => {
-            eprintln!("desktop profile fetch timed out; using generic MCP instructions");
-            None
-        }
-    };
+pub async fn serve() -> anyhow::Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let server = ComputerUseMcp::new(socket, profile.as_deref());
+    let server = ComputerUseMcp::new();
     let owner = server.waits.owner();
+    let desktop = server.desktop.clone();
+    let stopped = server.shutdown.clone();
     let shutdown = async {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
             result = terminate.recv() => result.ok_or_else(|| anyhow::anyhow!("SIGTERM listener closed")),
+            () = stopped.cancelled() => Ok(()),
         }
     };
     tokio::pin!(shutdown);
@@ -860,37 +1052,56 @@ pub async fn serve(socket: PathBuf) -> anyhow::Result<()> {
     let transport = transport::WaitTransport::new(
         AsyncRwTransport::new_server(stdin, stdout),
         server.waits.clone(),
+        desktop.clone(),
+        stopped.clone(),
     );
-    let running = tokio::select! {
-        result = server.serve(transport) => result?,
-        signal = &mut shutdown => {
-            owner.shutdown().await;
-            return signal;
+    let result = async {
+        let running = tokio::select! {
+            result = server.serve(transport) => result?,
+            signal = &mut shutdown => return signal,
+        };
+        let cancellation = running.cancellation_token();
+        let waiting = running.waiting();
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => result.map(|_| ()).map_err(anyhow::Error::from),
+            signal = &mut shutdown => {
+                stopped.cancel();
+                desktop.stop();
+                owner.shutdown().await;
+                cancellation.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut waiting).await;
+                signal
+            }
         }
-    };
-    let cancellation = running.cancellation_token();
-    let waiting = running.waiting();
-    tokio::pin!(waiting);
-    let result = tokio::select! {
-        result = &mut waiting => result.map(|_| ()).map_err(anyhow::Error::from),
-        signal = &mut shutdown => {
-            // Close the independent publication gate before rmcp drains handlers.
-            // A hung observe/act must not hold up async wait cleanup.
-            owner.shutdown().await;
-            cancellation.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), &mut waiting).await;
-            signal
-        }
-    };
+    }
+    .await;
+    stopped.cancel();
     owner.shutdown().await;
+    desktop.shutdown().await;
     result
 }
 
-fn compose_instructions(profile: Option<&str>) -> String {
-    match profile {
-        Some(profile) => format!("{MCP_INSTRUCTIONS}\n\nDesktop profile:\n{profile}"),
-        None => MCP_INSTRUCTIONS.to_owned(),
-    }
+fn connected(state: &McpSessionState) -> Result<Connection, CallToolResult> {
+    state.connection.clone().ok_or_else(|| {
+        CallToolResult::structured_error(json!({
+            "code": "not_connected",
+            "message": "call computer_connect with type private, default, or named before using the desktop",
+        }))
+    })
+}
+
+fn connection_error(target: &McpConnectRequest, error: &anyhow::Error) -> CallToolResult {
+    let message = match target {
+        McpConnectRequest::Private {} => format!(
+            "private desktop unavailable: {error:#}; call computer_connect with type private to retry"
+        ),
+        McpConnectRequest::Default {} => format!("default daemon unavailable: {error:#}"),
+        McpConnectRequest::Named { name } => {
+            format!("named instance {name} unavailable: {error:#}")
+        }
+    };
+    CallToolResult::structured_error(json!({ "code": "daemon_unavailable", "message": message }))
 }
 
 async fn fetch_profile(socket: &Path) -> anyhow::Result<Option<String>> {
@@ -911,10 +1122,17 @@ async fn fetch_profile(socket: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
+fn cancelled_connect_result() -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "code": "cancelled",
+        "message": "the connection attempt was cancelled; call computer_connect before continuing",
+    }))
+}
+
 fn cancelled_result() -> CallToolResult {
     CallToolResult::structured_error(json!({
         "code": "cancelled",
-        "message": "the computer operation was cancelled; call computer_observe before continuing",
+        "message": "the computer operation was cancelled; call computer_observe and inspect the desktop before continuing",
     }))
 }
 
@@ -925,11 +1143,28 @@ fn stale_frame_result(message: &str) -> CallToolResult {
 fn unexpected_response(operation: &str) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "code": "internal",
-        "message": format!("daemon returned the wrong response to computer_{operation}"),
+        "message": format!("daemon returned the wrong response to computer_{operation}; call computer_observe and inspect the desktop before continuing"),
     }))
 }
 
-fn structured_error(error: &impl Serialize) -> CallToolResult {
+fn with_recovery(mut error: CuError) -> CuError {
+    let hint = match error.code {
+        ErrorCode::Indeterminate | ErrorCode::InputFailed | ErrorCode::PartialExecution => {
+            "call computer_observe and inspect the desktop before issuing more actions; do not repeat completed actions"
+        }
+        ErrorCode::CaptureFailed | ErrorCode::ViewportChanged | ErrorCode::Cancelled => {
+            "call computer_observe before continuing"
+        }
+        ErrorCode::Busy => "wait for the active wait to finish before starting another",
+        _ => return error,
+    };
+    error.message.push_str("; ");
+    error.message.push_str(hint);
+    error
+}
+
+fn structured_error(error: &CuError) -> CallToolResult {
+    let error = with_recovery(error.clone());
     match serde_json::to_value(error) {
         Ok(value) => CallToolResult::structured_error(value),
         Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
@@ -962,10 +1197,20 @@ async fn image_result(
     let image = match tokio::fs::read(&image_path).await {
         Ok(image) => image,
         Err(error) => {
-            return Ok(CallToolResult::structured_error(json!({
+            let mut failure = json!({
                 "code": "image_unavailable",
-                "message": format!("failed to read captured PNG: {error}"),
-            })));
+                "message": format!("failed to read captured PNG: {error}; call computer_observe and inspect the desktop before continuing"),
+            });
+            if let Some(executed) = metadata.get("executed") {
+                failure["executed"] = executed.clone();
+                if let Some(action_error) = metadata.get("action_error") {
+                    failure["action_error"] = action_error.clone();
+                }
+                failure["message"] = json!(format!(
+                    "failed to read the post-action PNG: {error}; {executed} actions are recorded as executed. Call computer_observe and inspect the desktop before continuing; do not repeat completed actions"
+                ));
+            }
+            return Ok(CallToolResult::structured_error(failure));
         }
     };
     let mut result = CallToolResult::structured(metadata);
@@ -977,6 +1222,7 @@ async fn image_result(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use tempfile::TempDir;
 
     use super::*;
@@ -1002,7 +1248,7 @@ mod tests {
 
     #[test]
     fn exposes_only_the_agent_loop_tools() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let mut names = server
             .tool_router
             .list_all()
@@ -1011,12 +1257,20 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
 
-        assert_eq!(names, ["computer_act", "computer_observe", "computer_wait"]);
+        assert_eq!(
+            names,
+            [
+                "computer_act",
+                "computer_connect",
+                "computer_observe",
+                "computer_wait"
+            ]
+        );
     }
 
     #[test]
     fn identifies_itself_and_explains_the_complete_agent_loop() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let info = server.get_info();
 
         assert_eq!(info.server_info.name, "cu");
@@ -1027,8 +1281,6 @@ mod tests {
             "computer_wait",
             "latest returned frame number",
             "[0,width)",
-            "stale_frame",
-            "partial execution",
             "authorization policy",
         ] {
             assert!(
@@ -1040,21 +1292,103 @@ mod tests {
     }
 
     #[test]
-    fn appends_the_daemon_profile_to_initialization_instructions() {
-        let server = ComputerUseMcp::new(
-            PathBuf::from("/tmp/not-used.sock"),
-            Some("# Desktop\n\nSuper+Left tiles the focused window left."),
-        );
+    fn initialization_requires_connection_and_connect_exposes_three_object_shapes() {
+        let server = ComputerUseMcp::new();
         let instructions = server.get_info().instructions.unwrap();
+        assert!(instructions.contains("computer_connect"));
+        assert!(!instructions.contains("Desktop profile:"));
+        let connect = tool(&server, "computer_connect");
+        let schema = serde_json::to_value(connect.input_schema).unwrap();
+        assert_eq!(schema["type"], "object");
+        let branches = schema["oneOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 3);
+        for (branch, kind) in branches.iter().zip(["private", "default", "named"]) {
+            assert_eq!(branch["properties"]["type"]["const"], kind);
+            assert_eq!(branch["additionalProperties"], false);
+            let required = branch["required"].as_array().unwrap();
+            assert!(required.contains(&json!("type")));
+            assert_eq!(required.contains(&json!("name")), kind == "named");
+            assert_eq!(branch["properties"].get("name").is_some(), kind == "named");
+        }
+        let name = &branches[2]["properties"]["name"];
+        assert_eq!(name["type"], "string");
+        assert_eq!(name["minLength"], 1);
+        assert_eq!(name["maxLength"], 64);
+        assert_eq!(name["pattern"], "^[A-Za-z0-9_.-]+$");
+    }
 
-        assert!(instructions.starts_with(MCP_INSTRUCTIONS));
-        assert!(instructions.contains("Desktop profile:\n# Desktop"));
-        assert!(instructions.contains("Super+Left tiles the focused window left."));
+    #[test]
+    fn connect_deserializes_validated_tagged_variants() {
+        assert!(matches!(
+            serde_json::from_value::<McpConnectRequest>(json!({"type": "private"})).unwrap(),
+            McpConnectRequest::Private {}
+        ));
+        assert!(matches!(
+            serde_json::from_value::<McpConnectRequest>(json!({"type": "default"})).unwrap(),
+            McpConnectRequest::Default {}
+        ));
+        for expected in [
+            "work".to_owned(),
+            "default".to_owned(),
+            "private".to_owned(),
+            "x11-99.A_1".to_owned(),
+            "a".repeat(64),
+        ] {
+            let McpConnectRequest::Named { name } =
+                serde_json::from_value(json!({"type": "named", "name": expected})).unwrap()
+            else {
+                panic!("expected named target")
+            };
+            assert_eq!(name.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn connect_rejects_malformed_tags_names_and_extra_fields() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"type": null}),
+            json!({"type": "work"}),
+            json!({"type": "PRIVATE"}),
+            json!({"instance": "default"}),
+            json!({"type": "named"}),
+            json!({"type": "named", "name": null}),
+            json!({"type": "private", "name": "work"}),
+            json!({"type": "private", "name": null}),
+            json!({"type": "default", "name": "work"}),
+            json!({"type": "default", "name": null}),
+            json!({"type": "private", "extra": true}),
+            json!({"type": "default", "instance": "work"}),
+            json!({"type": "named", "name": "work", "extra": true}),
+        ] {
+            assert!(
+                serde_json::from_value::<McpConnectRequest>(value.clone()).is_err(),
+                "accepted {value}"
+            );
+        }
+        for name in [
+            "",
+            " ",
+            ".",
+            "..",
+            "../escape",
+            "has/slash",
+            "空",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                serde_json::from_value::<McpConnectRequest>(json!({"type": "named", "name": name}))
+                    .is_err(),
+                "accepted {name}"
+            );
+        }
     }
 
     #[test]
     fn publishes_described_observe_and_action_schemas() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let observe = tool(&server, "computer_observe");
         let act = tool(&server, "computer_act");
         let wait = tool(&server, "computer_wait");
@@ -1134,11 +1468,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("image_expired"))
         );
-        assert!(
-            act_output["properties"]["image_expired"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("without repeating"))
-        );
+        assert_eq!(act_output["properties"]["image_expired"]["type"], "boolean");
+        let error_code = &act_output["$defs"]["McpActionError"]["properties"]["code"];
+        assert_eq!(error_code["type"], "string");
+        assert!(error_code.get("enum").is_none());
+        assert!(act_output["$defs"].get("ErrorCode").is_none());
         let act_observation_properties = &act_output["$defs"]["McpObservation"]["properties"];
         for omitted in ["frame_id", "image_path", "target", "coordinate_space"] {
             assert!(
@@ -1158,7 +1492,7 @@ mod tests {
 
     #[test]
     fn publishes_the_bounded_wait_schema_without_internal_frame_ids() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let wait = tool(&server, "computer_wait");
         let wait_annotations = wait.annotations.unwrap();
         assert_eq!(wait_annotations.read_only_hint, Some(true));
@@ -1202,7 +1536,7 @@ mod tests {
 
     #[test]
     fn normal_action_result_contains_every_schema_required_field() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let act_output = tool(&server, "computer_act").output_schema.unwrap();
         let normal = serde_json::to_value(McpActOutcome {
             status: ActStatus::Ok,
@@ -1215,6 +1549,7 @@ mod tests {
                 height: 80,
                 settled: true,
             }),
+            message: None,
         })
         .unwrap();
         for required in act_output["required"].as_array().unwrap() {
@@ -1229,10 +1564,17 @@ mod tests {
     #[tokio::test]
     async fn missing_daemon_returns_a_start_command_to_the_agent() {
         let directory = TempDir::new().unwrap();
-        let server = ComputerUseMcp::new(directory.path().join("missing.sock"), None);
+        let server = ComputerUseMcp::new();
+        let connection = Connection {
+            socket: directory.path().join("missing.sock"),
+            target: McpConnectRequest::Default {},
+            generation: Uuid::new_v4(),
+            cancelled: CancellationToken::new(),
+        };
 
         let Err(result) = server
             .request_daemon(
+                &connection,
                 "missing-daemon-test".to_owned(),
                 DaemonRequest::Observe(ObserveRequest::default()),
             )
@@ -1404,6 +1746,7 @@ mod tests {
         assert_eq!(structured["status"], "ok");
         assert_eq!(structured["executed"], 1);
         assert_eq!(structured["observation"]["frame"], 2);
+        assert!(structured.get("message").is_none());
         for omitted in ["frame_id", "image_path", "target", "coordinate_space"] {
             assert!(structured["observation"].get(omitted).is_none());
         }
@@ -1451,6 +1794,22 @@ mod tests {
         assert_eq!(structured["action_error"]["executed"], 1);
         assert!(structured["action_error"]["executed"].is_number());
         assert_eq!(structured["observation"]["frame"], 3);
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("Inspect the returned observation")
+        );
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("do not repeat")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content[0].as_text().unwrap().text).unwrap(),
+            *structured
+        );
         assert_eq!(result.content.len(), 2);
         assert!(result.content[1].as_image().is_some());
     }
@@ -1474,6 +1833,22 @@ mod tests {
         assert_eq!(structured["executed"], 1);
         assert_eq!(structured["image_expired"], true);
         assert!(structured.get("observation").is_none());
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("computer_observe")
+        );
+        assert!(
+            structured["message"]
+                .as_str()
+                .unwrap()
+                .contains("do not repeat")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content[0].as_text().unwrap().text).unwrap(),
+            *structured
+        );
         assert!(
             result
                 .content
@@ -1520,7 +1895,7 @@ mod tests {
 
     #[test]
     fn wait_results_contain_every_schema_required_field() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
         let wait_output = tool(&server, "computer_wait").output_schema.unwrap();
         let wait_output = &wait_output["$defs"]["McpWaitOutcome"];
         let outcomes = [
@@ -1702,10 +2077,11 @@ mod tests {
 
     #[test]
     fn numeric_and_string_request_ids_have_distinct_daemon_keys() {
-        let server = ComputerUseMcp::new(PathBuf::from("/tmp/not-used.sock"), None);
+        let server = ComputerUseMcp::new();
 
-        let numeric = server.action_request_id(&rmcp::model::RequestId::Number(7));
-        let string = server.action_request_id(&rmcp::model::RequestId::String("7".into()));
+        let numeric = server.action_request_id(&rmcp::model::RequestId::Number(7), Uuid::nil());
+        let string =
+            server.action_request_id(&rmcp::model::RequestId::String("7".into()), Uuid::nil());
 
         assert_ne!(numeric, string);
         assert!(numeric.ends_with(":n:7"));

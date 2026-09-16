@@ -88,7 +88,10 @@ async fn completion_before_cancellation_preserves_the_only_terminal_result() {
     received(finished).await;
     let published = fs::read(&path).unwrap();
     waits.cancel().await;
-    late.finish(&SignalResult::Cancelled { elapsed_ms: 43 });
+    late.finish(&SignalResult::Cancelled {
+        elapsed_ms: 43,
+        message: CANCELLED_MESSAGE,
+    });
     drop(late);
     owner.shutdown().await;
     drop(owner);
@@ -210,6 +213,12 @@ async fn panicking_worker_publishes_an_error_and_releases_the_pending_slot() {
     let failed = result(&path);
     assert_eq!(failed["status"], "error");
     assert_eq!(failed["code"], "internal");
+    assert!(
+        failed["message"]
+            .as_str()
+            .unwrap()
+            .contains("computer_observe")
+    );
     assert!(lock(&waits.control).pending.is_none());
 
     let (next_path, next_finished) = register(&waits, "baseline", |guard| async move {
@@ -327,10 +336,14 @@ async fn late_detector_after_shutdown_wakes_once_for_every_terminal_status() {
                 height: 4,
             },
             settled: true,
+            message: "call computer_observe",
         },
         SignalResult::Timeout { elapsed_ms: 6 },
         SignalResult::error(7, "daemon_unavailable", "disconnected"),
-        SignalResult::Cancelled { elapsed_ms: 8 },
+        SignalResult::Cancelled {
+            elapsed_ms: 8,
+            message: CANCELLED_MESSAGE,
+        },
     ];
     for terminal in results {
         let root = tempfile::tempdir().unwrap();

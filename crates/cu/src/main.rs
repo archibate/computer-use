@@ -1,11 +1,12 @@
 mod backend;
 mod client;
 mod daemon;
+mod desktop;
 mod mcp;
 
 use std::{
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read},
     os::unix::fs::PermissionsExt,
@@ -53,12 +54,6 @@ struct Cli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstanceName(String);
 
-impl Default for InstanceName {
-    fn default() -> Self {
-        Self("default".to_owned())
-    }
-}
-
 impl fmt::Display for InstanceName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -77,7 +72,7 @@ impl FromStr for InstanceName {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         {
             return Err(
-                "instance must be 1-64 ASCII letters, digits, dots, underscores, or hyphens"
+                "instance must be 1-64 ASCII letters, digits, dots, underscores, or hyphens; . and .. are not allowed"
                     .to_owned(),
             );
         }
@@ -96,7 +91,9 @@ struct DaemonPaths {
 enum Command {
     /// Run one independently named desktop session daemon.
     Daemon {
-        /// Named socket and frame-store namespace; defaults to `default`.
+        #[arg(long, hide = true, requires_all = ["socket", "frame_dir"], conflicts_with_all = ["instance", "backend", "display", "output", "profile"])]
+        offscreen_worker: bool,
+        /// Named socket and frame-store namespace; omit for the default daemon.
         #[arg(long, value_name = "NAME")]
         instance: Option<InstanceName>,
         /// Select a desktop backend from the session, or require one explicitly.
@@ -126,7 +123,7 @@ enum Command {
             value_parser = parse_max_frames
         )]
         max_frames: usize,
-        /// Trusted UTF-8 Markdown or text appended to MCP initialization instructions.
+        /// Trusted UTF-8 Markdown or text returned by `computer_connect` with this desktop's metadata.
         #[arg(long, value_name = "PATH")]
         profile: Option<PathBuf>,
         /// Raw socket override; requires `--frame-dir` and conflicts with `--instance`.
@@ -138,7 +135,7 @@ enum Command {
     },
     /// Capture a settled frame and print its JSON metadata.
     Observe {
-        /// Connect to this named instance; defaults to `default`.
+        /// Connect to this named instance; omit for the default daemon.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
         instance: Option<InstanceName>,
         /// Connect to this raw socket instead of a named instance.
@@ -167,7 +164,7 @@ enum Command {
         /// Required continuous stability after monitored activity.
         #[arg(long, default_value_t = DEFAULT_WAIT_QUIET_MS, value_parser = parse_wait_quiet)]
         quiet_ms: u64,
-        /// Connect to this named instance; defaults to `default`.
+        /// Connect to this named instance; omit for the default daemon.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
         instance: Option<InstanceName>,
         /// Connect to this raw socket instead of a named instance.
@@ -180,7 +177,7 @@ enum Command {
         /// Print the accepted action-input JSON Schema and exit.
         #[arg(long, conflicts_with_all = ["instance", "socket", "request_id"])]
         schema: bool,
-        /// Connect to this named instance; defaults to `default`.
+        /// Connect to this named instance; omit for the default daemon.
         #[arg(long, value_name = "NAME", conflicts_with = "socket")]
         instance: Option<InstanceName>,
         /// Connect to this daemon socket instead of the owner-only default.
@@ -190,25 +187,38 @@ enum Command {
         #[arg(long)]
         request_id: Option<String>,
     },
-    /// Serve `computer_observe`, `computer_wait`, and `computer_act` over MCP stdio.
-    Mcp {
-        /// Connect to this named instance; defaults to `default`.
-        #[arg(long, value_name = "NAME", conflicts_with = "socket")]
-        instance: Option<InstanceName>,
-        /// Connect to this raw socket instead of a named instance.
-        #[arg(long, conflicts_with = "instance")]
-        socket: Option<PathBuf>,
+    /// Serve desktop connection, observation, waiting, and input over MCP stdio.
+    Mcp,
+    #[command(name = "__desktop-child", hide = true)]
+    DesktopChild {
+        #[arg(long)]
+        parent: u32,
+        #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
+    #[command(name = "__desktop-ready", hide = true)]
+    DesktopReady,
 }
 
 fn main() -> Result<()> {
-    let command = Cli::parse().command;
-    let mcp_stdio = matches!(&command, Command::Mcp { .. });
+    let command = match Cli::parse().command {
+        Command::DesktopChild { parent, command } => return desktop::exec_child(parent, &command),
+        Command::DesktopReady => return desktop::notify_ready(),
+        command => command,
+    };
+    let uses_stdin = matches!(
+        &command,
+        Command::Mcp
+            | Command::Daemon {
+                offscreen_worker: true,
+                ..
+            }
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(run(command));
-    if mcp_stdio {
+    if uses_stdin {
         // Tokio's stdin reader can remain blocked after a signal with stdin
         // still open. mcp::serve has already closed its wait publication gate
         // and joined its worker; do not wait indefinitely for that input thread.
@@ -220,6 +230,7 @@ fn main() -> Result<()> {
 async fn run(command: Command) -> Result<()> {
     match command {
         Command::Daemon {
+            offscreen_worker,
             instance,
             backend,
             display,
@@ -231,8 +242,19 @@ async fn run(command: Command) -> Result<()> {
             socket,
             frame_dir,
         } => {
-            let profile = profile.as_deref().map(read_profile).transpose()?;
             let paths = resolve_daemon_paths(instance, socket, frame_dir)?;
+            if offscreen_worker {
+                return desktop::serve(
+                    paths,
+                    CaptureLimits {
+                        max_width,
+                        max_height,
+                    },
+                    max_frames,
+                )
+                .await;
+            }
+            let profile = profile.as_deref().map(read_profile).transpose()?;
             start_daemon(
                 paths,
                 BackendOptions {
@@ -298,8 +320,9 @@ async fn run(command: Command) -> Result<()> {
             )
             .await
         }
-        Command::Mcp { instance, socket } => {
-            mcp::serve(resolve_client_socket(instance, socket)?).await
+        Command::Mcp => mcp::serve().await,
+        Command::DesktopChild { .. } | Command::DesktopReady => {
+            unreachable!("handled before the runtime")
         }
     }
 }
@@ -483,7 +506,9 @@ fn resolve_daemon_paths(
 ) -> Result<DaemonPaths> {
     match (instance, socket, frame_dir) {
         (instance, None, None) => {
-            let instance_dir = named_instance_dir(&instance.unwrap_or_default());
+            let instance_dir = instance
+                .as_ref()
+                .map_or_else(default_runtime_dir, named_instance_dir);
             Ok(DaemonPaths {
                 socket: instance_dir.join("cu.sock"),
                 frame_dir: instance_dir.join("frames"),
@@ -519,17 +544,15 @@ fn resolve_client_socket(
     match (instance, socket) {
         (Some(_), Some(_)) => bail!("--instance cannot be combined with --socket"),
         (None, Some(socket)) => Ok(socket),
-        (instance, None) => Ok(named_instance_dir(&instance.unwrap_or_default()).join("cu.sock")),
+        (instance, None) => Ok(instance
+            .as_ref()
+            .map_or_else(default_runtime_dir, named_instance_dir)
+            .join("cu.sock")),
     }
 }
 
 fn named_instance_dir(instance: &InstanceName) -> PathBuf {
-    let runtime = default_runtime_dir();
-    if instance.0 == "default" {
-        runtime
-    } else {
-        runtime.join("instances").join(&instance.0)
-    }
+    default_runtime_dir().join("instances").join(&instance.0)
 }
 
 fn secure_managed_instance_dir(path: &Path) -> Result<()> {
@@ -646,6 +669,23 @@ mod tests {
 
         assert_eq!(paths.socket, runtime.join("cu.sock"));
         assert_eq!(paths.frame_dir, runtime.join("frames"));
+        assert_eq!(resolve_client_socket(None, None).unwrap(), paths.socket);
+    }
+
+    #[test]
+    fn explicit_default_and_private_names_use_the_named_namespace() {
+        for name in ["default", "private"] {
+            let instance = name.parse::<InstanceName>().unwrap();
+            let paths = resolve_daemon_paths(Some(instance.clone()), None, None).unwrap();
+            let directory = default_runtime_dir().join("instances").join(name);
+            assert_eq!(paths.socket, directory.join("cu.sock"));
+            assert_eq!(paths.frame_dir, directory.join("frames"));
+            assert_eq!(
+                resolve_client_socket(Some(instance), None).unwrap(),
+                paths.socket
+            );
+            assert!(Cli::try_parse_from(["cu", "daemon", "--instance", name]).is_ok());
+        }
     }
 
     #[test]
@@ -665,7 +705,7 @@ mod tests {
 
     #[test]
     fn instance_names_are_single_safe_path_segments() {
-        for valid in ["default", "x11-99", "wayland.HDMI-A-1", "a_b"] {
+        for valid in ["default", "private", "x11-99", "wayland.HDMI-A-1", "a_b"] {
             assert!(valid.parse::<InstanceName>().is_ok(), "rejected {valid}");
         }
         for invalid in ["", ".", "..", "../escape", "has/slash", "空"] {
@@ -674,6 +714,14 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn mcp_selects_instances_only_through_connect() {
+        assert!(Cli::try_parse_from(["cu", "mcp"]).is_ok());
+        assert!(Cli::try_parse_from(["cu", "mcp", "--instance", "default"]).is_err());
+        assert!(Cli::try_parse_from(["cu", "mcp", "--socket", "/tmp/cu.sock"]).is_err());
+        assert!(Cli::try_parse_from(["cu", "daemon", "--instance", "private"]).is_ok());
     }
 
     #[test]

@@ -18,6 +18,143 @@ const LIMIT: Duration = Duration::from_secs(5);
 
 #[test]
 #[ignore = "requires local Unix socket access"]
+fn action_recovery_reaches_text_and_structured_clients_with_execution_evidence() {
+    for case in [
+        "partial",
+        "expired",
+        "expired_partial",
+        "missing_image",
+        "indeterminate",
+    ] {
+        let mut mcp = McpFixture::new();
+        mcp.observe(2, "baseline");
+        mcp.call(3, "computer_act", json!({
+            "frame": 1,
+            "actions": [{"type": "keypress", "keys": ["A"]}, {"type": "keypress", "keys": ["B"]}]
+        }));
+        let mut outcome = mcp.action_outcome("acted");
+        if matches!(case, "partial" | "expired_partial" | "missing_image") {
+            outcome.status = ActStatus::Partial;
+            outcome.action_error =
+                Some(CuError::new(ErrorCode::InputFailed, "second input failed").with_executed(1));
+        }
+        if matches!(case, "expired" | "expired_partial") {
+            outcome.image_expired = true;
+            outcome.observation = None;
+        } else if case == "missing_image" {
+            outcome.observation.as_mut().unwrap().image_path = mcp
+                .directory
+                .path()
+                .join("missing.png")
+                .to_string_lossy()
+                .into_owned();
+        }
+        let response = if case == "indeterminate" {
+            ResponseResult::Error(
+                CuError::new(
+                    ErrorCode::Indeterminate,
+                    "one action executed; capture failed",
+                )
+                .with_executed(1),
+            )
+        } else {
+            ResponseResult::Ok(DaemonResponse::Act(outcome))
+        };
+        mcp.daemon_call().respond(response);
+        let response = mcp.response(3);
+        let result = &response["result"]["structuredContent"];
+        assert_eq!(result["executed"], 1, "{case}: {result}");
+        let message = result["message"].as_str().unwrap();
+        assert!(message.contains("do not repeat"), "{case}: {message}");
+        if case == "partial" {
+            assert!(message.contains("returned observation"));
+            assert_eq!(result["observation"]["frame"], 2);
+        } else {
+            assert!(message.contains("computer_observe"), "{case}: {message}");
+            assert!(!message.contains("returned observation"));
+            assert!(result.get("observation").is_none());
+        }
+        if matches!(case, "partial" | "expired_partial" | "missing_image") {
+            assert_eq!(result["action_error"]["code"], "input_failed");
+            assert_eq!(result["action_error"]["executed"], 1);
+        }
+        assert_eq!(
+            response["result"]["isError"],
+            matches!(case, "missing_image" | "indeterminate")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                response["result"]["content"][0]["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            *result
+        );
+        mcp.close();
+    }
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn daemon_cancelled_synchronous_wait_returns_recovery_and_clears_its_frame() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    mcp.call(3, "computer_wait", wait_arguments(1, false));
+    mcp.daemon_call()
+        .respond(ResponseResult::Error(CuError::new(
+            ErrorCode::Cancelled,
+            "screen-change wait was cancelled",
+        )));
+    let response = mcp.response(3);
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["code"], "cancelled");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("computer_observe")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *result
+    );
+    mcp.call(4, "computer_wait", wait_arguments(1, false));
+    assert_eq!(
+        mcp.response(4)["result"]["structuredContent"]["code"],
+        "stale_frame"
+    );
+    assert!(mcp.listener.accept().is_err());
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn lost_action_response_reports_uncertainty_and_observation_recovery() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    mcp.call(
+        3,
+        "computer_act",
+        json!({"frame": 1, "actions": [{"type": "keypress", "keys": ["A"]}]}),
+    );
+    drop(mcp.daemon_call());
+    let response = mcp.response(3);
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(response["result"]["isError"], true);
+    let message = result["message"].as_str().unwrap();
+    assert!(message.contains("outcome is unknown"));
+    assert!(message.contains("computer_observe"));
+    assert!(result.get("executed").is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *result
+    );
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
 fn async_wait_retains_private_results_across_new_starts_and_shutdown() {
     let mut mcp = McpFixture::new();
     mcp.observe(2, "baseline");
@@ -84,11 +221,19 @@ fn async_wait_retains_private_results_across_new_starts_and_shutdown() {
             observation,
         },
     )));
+    let changed = terminal_result(&second_path);
+    assert!(
+        changed["message"]
+            .as_str()
+            .unwrap()
+            .contains("computer_observe")
+    );
     assert_eq!(
-        terminal_result(&second_path),
+        changed,
         json!({
             "status": "changed", "elapsed_ms": 91, "settled": true,
-            "activity_bbox": {"x": 1, "y": 2, "width": 3, "height": 4}
+            "activity_bbox": {"x": 1, "y": 2, "width": 3, "height": 4},
+            "message": changed["message"]
         })
     );
     assert_eq!(watcher_wake_count(&second_path), 1);
@@ -250,6 +395,7 @@ fn daemon_failures_publish_visible_results_including_stale_and_cancelled_waits()
     for code in [
         ErrorCode::Busy,
         ErrorCode::InvalidAction,
+        ErrorCode::CaptureFailed,
         ErrorCode::ViewportChanged,
         ErrorCode::StaleFrame,
         ErrorCode::Cancelled,
@@ -265,10 +411,32 @@ fn daemon_failures_publish_visible_results_including_stale_and_cancelled_waits()
         let result = terminal_result(&path);
         if matches!(code, ErrorCode::StaleFrame | ErrorCode::Cancelled) {
             assert_eq!(result["status"], "cancelled", "{code}");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("computer_observe")
+            );
         } else {
             assert_eq!(result["status"], "error", "{code}");
             assert_eq!(result["code"], code.to_string());
-            assert_eq!(result["message"], "mock wait failure");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("mock wait failure")
+            );
+            if matches!(code, ErrorCode::ViewportChanged | ErrorCode::CaptureFailed) {
+                assert!(
+                    result["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("computer_observe")
+                );
+            }
+            if code == ErrorCode::Busy {
+                assert!(result["message"].as_str().unwrap().contains("active wait"));
+            }
         }
         assert_eq!(watcher_wake_count(&path), 1);
         assert!(result["elapsed_ms"].is_u64());
@@ -286,7 +454,12 @@ fn daemon_disconnect_publishes_error_and_releases_local_pending_slot() {
     let result = terminal_result(&path);
     assert_eq!(result["status"], "error");
     assert!(result["code"].is_string());
-    assert!(result["message"].is_string());
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("computer_observe")
+    );
     assert_eq!(watcher_wake_count(&path), 1);
 
     mcp.observe(4, "fresh");
@@ -503,6 +676,294 @@ fn explicit_false_wait_still_blocks_and_returns_the_synchronous_result() {
     mcp.close();
 }
 
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn desktop_operations_require_an_explicit_connection() {
+    let mut mcp = McpFixture::initialized();
+    for (id, name, arguments) in [
+        (2, "computer_observe", json!({})),
+        (
+            3,
+            "computer_act",
+            json!({"frame": 1, "actions": [{"type": "keypress", "keys": ["A"]}]}),
+        ),
+        (4, "computer_wait", wait_arguments(1, false)),
+        (5, "computer_wait", wait_arguments(1, true)),
+    ] {
+        mcp.call(id, name, arguments);
+        assert_eq!(
+            mcp.response(id)["result"]["structuredContent"]["code"],
+            "not_connected"
+        );
+    }
+    assert!(
+        mcp.listener.accept().is_err(),
+        "unconnected MCP contacted a daemon"
+    );
+    for (id, arguments) in [
+        (6, json!({})),
+        (7, json!({"type": null})),
+        (8, json!({"type": "named", "name": ""})),
+    ] {
+        mcp.call(id, "computer_connect", arguments);
+        let response = mcp.response(id);
+        assert!(response.get("error").is_some() || response["result"]["isError"] == true);
+    }
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    let signal = mcp.start_wait(3, 1);
+    let waiting = mcp.daemon_call();
+    for (index, arguments) in [
+        json!({"instance": "default"}),
+        json!({"type": "unknown"}),
+        json!({"type": "private", "name": "work"}),
+        json!({"type": "default", "name": null}),
+        json!({"type": "named"}),
+        json!({"type": "named", "name": ""}),
+        json!({"type": "named", "name": "../escape"}),
+        json!({"type": "named", "name": "."}),
+        json!({"type": "named", "name": ".."}),
+        json!({"type": "named", "name": "work", "extra": true}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 4 + u64::try_from(index).unwrap();
+        mcp.call(id, "computer_connect", arguments);
+        let response = mcp.response(id);
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("failed to deserialize parameters")
+        );
+        assert!(!signal.exists(), "invalid connect cancelled the wait");
+        assert!(
+            mcp.listener.accept().is_err(),
+            "invalid connect contacted a daemon"
+        );
+    }
+    waiting.respond(ResponseResult::Ok(DaemonResponse::Wait(
+        WaitOutcome::Timeout { elapsed_ms: 1 },
+    )));
+    assert_eq!(terminal_result(&signal)["status"], "timeout");
+    mcp.call(
+        20,
+        "computer_act",
+        json!({"frame": 1, "actions": [{"type": "keypress", "keys": ["A"]}]}),
+    );
+    mcp.daemon_call()
+        .respond(ResponseResult::Ok(DaemonResponse::Act(
+            mcp.action_outcome("acted"),
+        )));
+    assert_eq!(
+        mcp.response(20)["result"]["structuredContent"]["observation"]["frame"],
+        2
+    );
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn named_default_and_private_are_independent_daemon_names() {
+    for name in ["default", "private"] {
+        let mut mcp = McpFixture::new();
+        mcp.call(
+            2,
+            "computer_connect",
+            json!({"type": "named", "name": name}),
+        );
+        let error = mcp.response(2);
+        assert_eq!(
+            error["result"]["structuredContent"]["code"],
+            "daemon_unavailable"
+        );
+        let message = error["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains(&format!("cu daemon --instance {name}")));
+        assert!(!message.contains("type private"));
+        assert!(mcp.listener.accept().is_err());
+
+        let default_listener = mcp.replace_listener(name);
+        mcp.call(
+            3,
+            "computer_connect",
+            json!({"type": "named", "name": name}),
+        );
+        let profile = mcp.daemon_call();
+        assert!(matches!(profile.request.request, DaemonRequest::Profile));
+        profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(format!(
+            "named {name}"
+        )))));
+        let response = mcp.response(3);
+        assert_eq!(
+            response["result"]["structuredContent"]["profile"],
+            format!("named {name}")
+        );
+        assert!(default_listener.accept().is_err());
+        assert!(
+            !mcp.directory
+                .path()
+                .join("computer-use/mcp-desktops")
+                .exists()
+        );
+
+        let named_listener = std::mem::replace(&mut mcp.listener, default_listener);
+        mcp.connect(4, "default");
+        assert!(named_listener.accept().is_err());
+        mcp.close();
+    }
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn switching_instances_invalidates_old_frames_and_cached_actions() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "same-internal-id");
+    let action = json!({"frame": 1, "actions": [{"type": "keypress", "keys": ["A"]}]});
+    mcp.call(3, "computer_act", action.clone());
+    let old_action = mcp.daemon_call();
+    let old_request_id = old_action.request.request_id.clone();
+    old_action.respond(ResponseResult::Ok(DaemonResponse::Act(
+        mcp.action_outcome("action-frame"),
+    )));
+    assert_eq!(
+        mcp.response(3)["result"]["structuredContent"]["observation"]["frame"],
+        2
+    );
+    let old_listener = mcp.replace_listener("other");
+    mcp.connect(4, "other");
+    mcp.call(3, "computer_act", action);
+    assert_eq!(
+        mcp.response(3)["result"]["structuredContent"]["code"],
+        "stale_frame"
+    );
+    assert!(
+        mcp.listener.accept().is_err(),
+        "old action was replayed against the new daemon"
+    );
+    mcp.call(5, "computer_observe", json!({}));
+    mcp.daemon_call()
+        .respond(ResponseResult::Ok(DaemonResponse::Observe(
+            mcp.image_observation("same-internal-id"),
+        )));
+    assert_eq!(mcp.response(5)["result"]["structuredContent"]["frame"], 3);
+    mcp.call(
+        3,
+        "computer_act",
+        json!({"frame": 3, "actions": [{"type": "keypress", "keys": ["B"]}]}),
+    );
+    let action = mcp.daemon_call();
+    assert_ne!(action.request.request_id, old_request_id);
+    action.respond(ResponseResult::Ok(DaemonResponse::Act(
+        mcp.action_outcome("new-action"),
+    )));
+    assert_eq!(
+        mcp.response(3)["result"]["structuredContent"]["observation"]["frame"],
+        4
+    );
+    assert!(old_listener.accept().is_err());
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn reconnect_cancels_async_wait_and_requires_another_observation() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    let signal = mcp.start_wait(3, 1);
+    let waiting = mcp.daemon_call();
+    mcp.connect(4, "default");
+    waiting.assert_closed();
+    let cancelled = terminal_result(&signal);
+    assert_eq!(cancelled["status"], "cancelled");
+    mcp.call(5, "computer_wait", wait_arguments(1, false));
+    assert_eq!(
+        mcp.response(5)["result"]["structuredContent"]["code"],
+        "stale_frame"
+    );
+    mcp.observe(6, "next");
+    assert_eq!(terminal_result(&signal), cancelled);
+    let next = mcp.start_wait(7, 2);
+    mcp.daemon_call()
+        .respond(ResponseResult::Ok(DaemonResponse::Wait(
+            WaitOutcome::Timeout { elapsed_ms: 1 },
+        )));
+    assert_eq!(terminal_result(&next)["status"], "timeout");
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn connect_actively_cancels_a_synchronous_wait_on_an_unchanged_daemon() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    mcp.call(3, "computer_wait", wait_arguments(1, false));
+    let waiting = mcp.daemon_call();
+    mcp.call(4, "computer_connect", json!({"type": "default"}));
+    let profile = mcp.daemon_call();
+    waiting.assert_closed();
+    profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(
+        "reconnected".to_owned(),
+    ))));
+    let responses = mcp.responses_for(&[3, 4]);
+    assert_eq!(
+        responses[&3]["result"]["structuredContent"]["code"],
+        "cancelled"
+    );
+    assert_eq!(
+        responses[&4]["result"]["structuredContent"]["profile"],
+        "reconnected"
+    );
+    mcp.observe(5, "next");
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn failed_or_cancelled_connect_stays_disconnected() {
+    let mut mcp = McpFixture::new();
+    mcp.observe(2, "baseline");
+    mcp.call(
+        3,
+        "computer_connect",
+        json!({"type": "named", "name": "missing"}),
+    );
+    assert_eq!(
+        mcp.response(3)["result"]["structuredContent"]["code"],
+        "daemon_unavailable"
+    );
+    mcp.call(4, "computer_observe", json!({}));
+    assert_eq!(
+        mcp.response(4)["result"]["structuredContent"]["code"],
+        "not_connected"
+    );
+    assert!(mcp.listener.accept().is_err());
+    mcp.call(5, "computer_connect", json!({"type": "default"}));
+    let pending = mcp.daemon_call();
+    mcp.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 5}}),
+    );
+    pending.assert_closed();
+    // rmcp permits a cancellation to suppress its tool response.
+    let _ = mcp.responses.recv_timeout(Duration::from_millis(100));
+    mcp.call(6, "computer_observe", json!({}));
+    assert_eq!(
+        mcp.response(6)["result"]["structuredContent"]["code"],
+        "not_connected"
+    );
+    assert!(mcp.listener.accept().is_err());
+    mcp.close();
+}
+
 struct McpFixture {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -513,7 +974,67 @@ struct McpFixture {
 }
 
 impl McpFixture {
+    fn connect(&mut self, id: u64, instance: &str) {
+        let arguments = if instance == "default" {
+            json!({"type": "default"})
+        } else {
+            json!({"type": "named", "name": instance})
+        };
+        self.call(id, "computer_connect", arguments);
+        let profile = self.daemon_call();
+        assert!(matches!(profile.request.request, DaemonRequest::Profile));
+        profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(format!(
+            "profile for {instance}"
+        )))));
+        let response = self.response(id);
+        assert_eq!(
+            response["result"]["structuredContent"]["instance"],
+            instance
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["profile"],
+            format!("profile for {instance}")
+        );
+    }
+
+    fn replace_listener(&mut self, name: &str) -> UnixListener {
+        let directory = self
+            .directory
+            .path()
+            .join("computer-use/instances")
+            .join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let listener = UnixListener::bind(directory.join("cu.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::mem::replace(&mut self.listener, listener)
+    }
+
+    fn responses_for(&self, ids: &[u64]) -> std::collections::HashMap<u64, Value> {
+        let mut results = std::collections::HashMap::new();
+        while results.len() < ids.len() {
+            let response = self.responses.recv_timeout(LIMIT).expect("MCP response");
+            if let Some(id) = response["id"].as_u64() {
+                assert!(ids.contains(&id));
+                assert!(results.insert(id, response).is_none());
+            }
+        }
+        results
+    }
+
     fn new() -> Self {
+        let mut fixture = Self::initialized();
+        fixture.call(0, "computer_connect", json!({"type": "default"}));
+        let profile = fixture.daemon_call();
+        assert!(matches!(profile.request.request, DaemonRequest::Profile));
+        profile.respond(ResponseResult::Ok(DaemonResponse::Profile(None)));
+        assert_eq!(
+            fixture.response(0)["result"]["structuredContent"]["instance"],
+            "default"
+        );
+        fixture
+    }
+
+    fn initialized() -> Self {
         let mut fixture = Self::uninitialized();
         fixture.send(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -529,14 +1050,16 @@ impl McpFixture {
 
     fn uninitialized() -> Self {
         let directory = tempfile::TempDir::new().expect("create test runtime");
-        let socket = directory.path().join("cu.sock");
+        let runtime = directory.path().join("computer-use");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = runtime.join("cu.sock");
         let image = directory.path().join("frame.png");
         std::fs::write(&image, [1, 2, 3]).unwrap();
         let listener = UnixListener::bind(&socket).expect("bind mock daemon");
         listener.set_nonblocking(true).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_cu"))
-            .args(["mcp", "--socket"])
-            .arg(&socket)
+            .arg("mcp")
             .env("XDG_RUNTIME_DIR", directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -557,18 +1080,14 @@ impl McpFixture {
                 }
             }
         });
-        let fixture = Self {
+        Self {
             child,
             stdin,
             responses,
             listener,
             directory,
             image,
-        };
-        let profile = fixture.daemon_call();
-        assert!(matches!(profile.request.request, DaemonRequest::Profile));
-        profile.respond(ResponseResult::Ok(DaemonResponse::Profile(None)));
-        fixture
+        }
     }
 
     fn send(&mut self, value: &Value) {
@@ -639,8 +1158,17 @@ impl McpFixture {
         let response = self.response(id);
         let result = &response["result"]["structuredContent"];
         assert_eq!(result["status"], "started", "{response}");
-        assert_eq!(result.as_object().unwrap().len(), 2);
+        assert_eq!(result.as_object().unwrap().len(), 3);
+        assert!(result["message"].as_str().unwrap().contains("monitor"));
+        assert!(result["message"].as_str().unwrap().contains("JSON result"));
         assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                response["result"]["content"][0]["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            *result
+        );
         PathBuf::from(
             result["signal_path"]
                 .as_str()

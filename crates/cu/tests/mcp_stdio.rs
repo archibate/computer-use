@@ -14,11 +14,8 @@ use cu_protocol::{
 
 #[test]
 fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
-    let directory = tempfile::TempDir::new().expect("create temporary directory");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cu"))
         .arg("mcp")
-        .arg("--socket")
-        .arg(directory.path().join("missing.sock"))
         .env_remove("XDG_RUNTIME_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -55,10 +52,7 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
     let output = child.wait_with_output().expect("wait for cu mcp");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "cu mcp failed: {stderr}");
-    assert!(
-        stderr.contains("desktop profile unavailable; using generic MCP instructions"),
-        "missing fallback diagnostic: {stderr}"
-    );
+    assert!(!stderr.contains("desktop profile unavailable"));
 
     let stdout = String::from_utf8(output.stdout).expect("MCP response is UTF-8");
     let responses = stdout
@@ -119,7 +113,9 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
 #[allow(clippy::too_many_lines)]
 fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
     let directory = tempfile::TempDir::new().expect("create temporary directory");
-    let socket = directory.path().join("cu.sock");
+    let runtime = directory.path().join("computer-use");
+    std::fs::create_dir(&runtime).unwrap();
+    let socket = runtime.join("cu.sock");
     let first_image = directory.path().join("first.png");
     let second_image = directory.path().join("second.png");
     std::fs::write(&first_image, [1, 2, 3]).unwrap();
@@ -192,8 +188,7 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_cu"))
         .arg("mcp")
-        .arg("--socket")
-        .arg(&socket)
+        .env("XDG_RUNTIME_DIR", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -214,6 +209,20 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
     )
     .unwrap();
 
+    writeln!(
+        stdin,
+        "{}",
+        tool_call(
+            0,
+            "computer_connect",
+            &serde_json::json!({"type": "default"})
+        )
+    )
+    .unwrap();
+    assert_eq!(
+        read_mcp_response(&mut stdout)["result"]["structuredContent"]["instance"],
+        "default"
+    );
     writeln!(
         stdin,
         "{}",
@@ -266,7 +275,9 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
 #[allow(clippy::too_many_lines)]
 fn mcp_cancellation_disconnects_the_inflight_daemon_wait() {
     let directory = tempfile::TempDir::new().expect("create temporary directory");
-    let socket = directory.path().join("cu.sock");
+    let runtime = directory.path().join("computer-use");
+    std::fs::create_dir(&runtime).unwrap();
+    let socket = runtime.join("cu.sock");
     let image_path = directory.path().join("frame.png");
     std::fs::write(&image_path, [1, 2, 3]).unwrap();
     let listener = UnixListener::bind(&socket).expect("bind mock daemon");
@@ -311,8 +322,7 @@ fn mcp_cancellation_disconnects_the_inflight_daemon_wait() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_cu"))
         .arg("mcp")
-        .arg("--socket")
-        .arg(&socket)
+        .env("XDG_RUNTIME_DIR", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -328,6 +338,20 @@ fn mcp_cancellation_disconnects_the_inflight_daemon_wait() {
         serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
     )
     .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        tool_call(
+            0,
+            "computer_connect",
+            &serde_json::json!({"type": "default"})
+        )
+    )
+    .unwrap();
+    assert_eq!(
+        read_mcp_response(&mut stdout)["result"]["structuredContent"]["instance"],
+        "default"
+    );
     writeln!(
         stdin,
         "{}",

@@ -13,15 +13,22 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{FrameBinding, McpSessionState, signal::SignalStore, wait_error_invalidates_frame};
+use super::{
+    FrameBinding, McpSessionState, signal::SignalStore, wait_error_invalidates_frame, with_recovery,
+};
 use crate::client;
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCELLED_MESSAGE: &str = "The wait was cancelled or superseded; call computer_observe for a current screenshot before continuing.";
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum McpWaitStarted {
-    Started { signal_path: String },
+    Started {
+        signal_path: String,
+        /// Guidance specific to this result.
+        message: &'static str,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +38,7 @@ enum SignalResult {
         elapsed_ms: u64,
         activity_bbox: Rect,
         settled: bool,
+        message: &'static str,
     },
     Timeout {
         elapsed_ms: u64,
@@ -42,6 +50,7 @@ enum SignalResult {
     },
     Cancelled {
         elapsed_ms: u64,
+        message: &'static str,
     },
 }
 
@@ -62,6 +71,7 @@ impl SignalResult {
                         elapsed_ms,
                         activity_bbox,
                         settled: observation.settled,
+                        message: "Monitored activity was detected; call computer_observe to inspect the current desktop before continuing.",
                     },
                     true,
                 ),
@@ -71,9 +81,16 @@ impl SignalResult {
                 ..
             }) => {
                 if matches!(error.code, ErrorCode::StaleFrame | ErrorCode::Cancelled) {
-                    return (Self::Cancelled { elapsed_ms }, true);
+                    return (
+                        Self::Cancelled {
+                            elapsed_ms,
+                            message: CANCELLED_MESSAGE,
+                        },
+                        true,
+                    );
                 }
                 let invalidates = wait_error_invalidates_frame(error.code);
+                let error = with_recovery(error);
                 (
                     Self::error(elapsed_ms, error.code.to_string(), error.message),
                     invalidates,
@@ -83,12 +100,16 @@ impl SignalResult {
                 Self::error(
                     elapsed_ms,
                     "internal",
-                    "daemon returned the wrong wait response",
+                    "daemon returned the wrong wait response; call computer_observe before continuing",
                 ),
                 true,
             ),
             Err(error) => (
-                Self::error(elapsed_ms, "daemon_unavailable", error.to_string()),
+                Self::error(
+                    elapsed_ms,
+                    "daemon_unavailable",
+                    format!("{error}; call computer_observe before continuing"),
+                ),
                 true,
             ),
         }
@@ -130,6 +151,7 @@ impl Control {
         let pending = self.pending.take()?;
         let result = SignalResult::Cancelled {
             elapsed_ms: elapsed_millis(pending.started),
+            message: CANCELLED_MESSAGE,
         };
         let task = self.publish(pending, &result);
         task.abort();
@@ -214,7 +236,10 @@ impl AsyncWaits {
             signal,
             task,
         });
-        Ok(McpWaitStarted::Started { signal_path })
+        Ok(McpWaitStarted::Started {
+            signal_path,
+            message: "Use a monitor to notify when signal_path appears, then read its JSON result.",
+        })
     }
 
     pub(super) async fn cancel(&self) {
@@ -314,7 +339,7 @@ impl Drop for WorkerGuard {
             let result = SignalResult::error(
                 elapsed_millis(pending.started),
                 "internal",
-                "asynchronous wait worker stopped unexpectedly",
+                "asynchronous wait worker stopped unexpectedly; call computer_observe before starting another wait",
             );
             drop(control.publish(pending, &result));
         }

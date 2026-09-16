@@ -38,6 +38,17 @@ fn connection_error(socket: &Path, error: &io::Error) -> anyhow::Error {
     } else {
         format!("failed to connect to {}: {error}", socket.display())
     };
+    if socket.file_name().is_some_and(|name| name == "cu.sock")
+        && socket
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "mcp-desktops")
+    {
+        return anyhow!(
+            "{summary}\ncall computer_connect with type private to recreate its desktop"
+        );
+    }
     let start_command = named_instance_from_socket(socket).map_or_else(
         || "`cu daemon`".to_owned(),
         |instance| format!("`cu daemon --instance {instance}`"),
@@ -83,5 +94,19 @@ mod tests {
         );
 
         assert!(error.to_string().contains("`cu daemon --instance x11-99`"));
+    }
+
+    #[test]
+    fn missing_private_desktop_recommends_connect_without_starting_a_public_daemon() {
+        let error = connection_error(
+            Path::new("/run/user/1000/computer-use/mcp-desktops/test/cu.sock"),
+            &io::Error::from(io::ErrorKind::NotFound),
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("computer_connect with type private")
+        );
+        assert!(!error.to_string().contains("cu daemon"));
     }
 }
