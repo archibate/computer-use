@@ -43,13 +43,21 @@ Wayland session selects the direct Wayland backend even when XWayland also sets
 automatic mode, while `--output` selects direct Wayland. `--max-width` and
 `--max-height` add optional downscaling limits for either backend.
 
-`--profile` loads a trusted UTF-8 Markdown or text file of at most 16 KiB. The
-daemon serves that text to MCP adapters, which append it once to their
-initialization instructions. This keeps desktop-specific operating guidance,
-such as verified window-manager shortcuts, out of the generic tool schemas and
-per-frame responses. After changing the file, restart the daemon and then the
-MCP connection so both reload it. If the daemon or profile is unavailable when
-MCP starts, that connection keeps the generic instructions until it reconnects.
+MCP initialization includes connection metadata from the daemon's active backend:
+X11 display and screen (for example, `backend=x11, display=":99", screen=0`), or
+the absolute Wayland socket path and selected output. Wayland also includes
+`x11_display` when the daemon's `DISPLAY` is set; this is an environment hint,
+not a verified association with the same compositor. An inherited `WAYLAND_SOCKET`
+connection is identified as `connection=inherited_fd` instead of a socket path.
+This metadata is included even without `--profile`; it is sent once in
+initialization instructions, not in per-frame tool responses.
+
+`--profile` loads a trusted UTF-8 Markdown or text file of at most 16 KiB and
+appends it after the connection metadata. This keeps desktop-specific operating
+guidance, such as verified window-manager shortcuts, out of the generic tool
+schemas. After changing the daemon target or profile, restart the daemon and
+reconnect MCP to refresh both. If the daemon is unavailable when MCP starts,
+that connection keeps the generic instructions until it reconnects.
 
 | Desktop session | Backend | Status |
 | --- | --- | --- |

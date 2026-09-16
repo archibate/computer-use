@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -30,6 +30,8 @@ pub struct StartedBackend {
 struct SessionEnvironment {
     session_type: Option<String>,
     wayland_display: Option<String>,
+    runtime_dir: Option<PathBuf>,
+    inherited_wayland_socket: bool,
     x11_display: Option<String>,
 }
 
@@ -50,7 +52,7 @@ pub fn start(options: &BackendOptions) -> Result<StartedBackend> {
                 .context(
                     "direct Wayland backend unavailable; this compositor may require the not-yet-implemented portal backend",
                 )?;
-            let target = format!("direct Wayland output {}", backend.output_name());
+            let target = environment.wayland_target(backend.output_name());
             Ok(StartedBackend {
                 desktop: Box::new(backend),
                 target,
@@ -61,7 +63,7 @@ pub fn start(options: &BackendOptions) -> Result<StartedBackend> {
                 .map_err(anyhow::Error::new)
                 .context("X11 backend unavailable")?;
             let target = format!(
-                "X11 display {} screen {}",
+                "backend=x11, display={:?}, screen={}",
                 backend.display(),
                 backend.screen_index()
             );
@@ -79,8 +81,42 @@ impl SessionEnvironment {
             session_type: environment_value("XDG_SESSION_TYPE")
                 .map(|value| value.to_ascii_lowercase()),
             wayland_display: environment_value("WAYLAND_DISPLAY"),
+            runtime_dir: env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            inherited_wayland_socket: env::var("WAYLAND_SOCKET").is_ok(),
             x11_display: environment_value("DISPLAY"),
         }
+    }
+
+    #[allow(
+        clippy::unnecessary_debug_formatting,
+        reason = "quote and escape socket paths"
+    )]
+    fn wayland_target(&self, output: &str) -> String {
+        let connection = if self.inherited_wayland_socket {
+            "connection=inherited_fd".to_owned()
+        } else {
+            let socket = self.wayland_display.as_ref().and_then(|display| {
+                let path = PathBuf::from(display);
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    self.runtime_dir
+                        .as_ref()
+                        .filter(|directory| directory.is_absolute())
+                        .map(|directory| directory.join(path))
+                }
+            });
+            socket.map_or_else(
+                || "display=unknown".to_owned(),
+                |path| format!("display={path:?}"),
+            )
+        };
+        let x11_display = self
+            .x11_display
+            .as_ref()
+            .map(|display| format!(", x11_display={display:?}"))
+            .unwrap_or_default();
+        format!("backend=wayland, {connection}, output={output:?}{x11_display}")
     }
 }
 
@@ -185,6 +221,7 @@ mod tests {
             session_type: Some("wayland".to_owned()),
             wayland_display: Some("wayland-1".to_owned()),
             x11_display: Some(":1".to_owned()),
+            ..SessionEnvironment::default()
         };
 
         assert_eq!(
@@ -199,6 +236,7 @@ mod tests {
             session_type: Some("x11".to_owned()),
             wayland_display: None,
             x11_display: Some(":0".to_owned()),
+            ..SessionEnvironment::default()
         };
 
         assert_eq!(
@@ -217,6 +255,7 @@ mod tests {
             session_type: Some("wayland".to_owned()),
             wayland_display: Some("wayland-1".to_owned()),
             x11_display: Some(":1".to_owned()),
+            ..SessionEnvironment::default()
         };
 
         assert_eq!(
@@ -233,6 +272,7 @@ mod tests {
             session_type: Some("wayland".to_owned()),
             wayland_display: None,
             x11_display: Some(":1".to_owned()),
+            ..SessionEnvironment::default()
         };
 
         let error = resolve_backend(&options(BackendChoice::Auto), &environment).unwrap_err();
@@ -250,5 +290,53 @@ mod tests {
         };
 
         assert!(resolve_backend(&options, &environment).is_err());
+    }
+
+    #[test]
+    fn wayland_metadata_resolves_the_socket_and_keeps_x11_separate() {
+        let environment = SessionEnvironment {
+            wayland_display: Some("wayland-2".to_owned()),
+            runtime_dir: Some(PathBuf::from("/run/user/1234")),
+            x11_display: Some(":99".to_owned()),
+            ..SessionEnvironment::default()
+        };
+
+        assert_eq!(
+            environment.wayland_target("DP-1"),
+            "backend=wayland, display=\"/run/user/1234/wayland-2\", output=\"DP-1\", x11_display=\":99\""
+        );
+
+        let absolute = SessionEnvironment {
+            wayland_display: Some("/tmp/nested/wayland-3".to_owned()),
+            runtime_dir: Some(PathBuf::from("/run/user/1234")),
+            ..SessionEnvironment::default()
+        };
+        assert_eq!(
+            absolute.wayland_target("DP-2"),
+            "backend=wayland, display=\"/tmp/nested/wayland-3\", output=\"DP-2\""
+        );
+    }
+
+    #[test]
+    fn wayland_metadata_does_not_guess_an_inherited_or_unresolved_socket() {
+        let mut environment = SessionEnvironment {
+            wayland_display: Some("/tmp/not-the-connected-socket".to_owned()),
+            inherited_wayland_socket: true,
+            ..SessionEnvironment::default()
+        };
+        assert_eq!(
+            environment.wayland_target("DP-1"),
+            "backend=wayland, connection=inherited_fd, output=\"DP-1\""
+        );
+
+        environment.inherited_wayland_socket = false;
+        environment.wayland_display = Some("wayland-1".to_owned());
+        for directory in [None, Some(PathBuf::from("relative-runtime"))] {
+            environment.runtime_dir = directory;
+            assert_eq!(
+                environment.wayland_target("DP-1"),
+                "backend=wayland, display=unknown, output=\"DP-1\""
+            );
+        }
     }
 }

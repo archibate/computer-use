@@ -76,7 +76,7 @@ struct McpWaitRequest {
     #[serde(default = "default_wait_quiet_ms")]
     #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
-    /// Return signal_path immediately. Use a monitor to notify when the file appears which indicates completion. Observe cancels pending waits; observe again after notification.
+    /// Return `signal_path` immediately. Use a monitor to notify when the file appears which indicates completion. Observe cancels pending waits; observe again after notification.
     #[serde(default, rename = "async")]
     async_mode: bool,
 }

@@ -324,7 +324,13 @@ async fn start_daemon(
     }
     let bound = daemon::bind(paths.socket.clone()).await?;
     let started = backend::start(&options)?;
-    let engine = Engine::new(started.desktop, paths.frame_dir, max_frames)?.with_profile(profile);
+    let mut desktop_profile = format!("Desktop connection: {}", started.target);
+    if let Some(profile) = profile {
+        desktop_profile.push_str("\n\n");
+        desktop_profile.push_str(&profile);
+    }
+    let engine = Engine::new(started.desktop, paths.frame_dir, max_frames)?
+        .with_profile(Some(desktop_profile));
     eprintln!("computer-use daemon targeting {}", started.target);
     eprintln!(
         "computer-use daemon listening at {}",
