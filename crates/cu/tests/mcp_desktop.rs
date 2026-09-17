@@ -82,7 +82,7 @@ fn private_desktops_are_authenticated_reusable_and_operable() {
         writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
     });
     assert_eq!(
-        first.call("computer_connect", json!({"type":"default"}))["structuredContent"]["profile"],
+        first.call("computer_connect", json!({"name":"@default"}))["structuredContent"]["profile"],
         "public desktop"
     );
     public.join().unwrap();
@@ -90,7 +90,7 @@ fn private_desktops_are_authenticated_reusable_and_operable() {
     assert!(x.get_geometry(blue).unwrap().reply().is_ok());
     // A failed switch leaves the private desktop alive and the session disconnected.
     assert_eq!(
-        first.call("computer_connect", json!({"type":"named","name":"missing"}))["isError"],
+        first.call("computer_connect", json!({"name":"missing"}))["isError"],
         true
     );
     assert_eq!(
@@ -210,7 +210,7 @@ fn failed_timed_out_and_cancelled_startup_roll_back() {
             fs::set_permissions(fake, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let mut mcp = Mcp::new(Some(bin.path()));
-        let id = mcp.start_call("computer_connect", json!({"type":"private"}));
+        let id = mcp.start_call("computer_connect", json!({"name":"@private"}));
         let owned = if matches!(mode, "timeout" | "cancel" | "eof" | "kill") {
             until(|| !children(mcp.child.id()).is_empty());
             let worker = children(mcp.child.id())[0];
@@ -357,7 +357,7 @@ impl Mcp {
     }
 
     fn connect(&mut self) -> Desktop {
-        let result = self.call("computer_connect", json!({"type":"private"}));
+        let result = self.call("computer_connect", json!({"name":"@private"}));
         assert_ne!(result["isError"], true, "{result}");
         let profile = result["structuredContent"]["profile"]
             .as_str()

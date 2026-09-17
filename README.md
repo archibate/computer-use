@@ -25,7 +25,7 @@ instead, run `cargo install --locked --path crates/cu --root "$HOME/.local" --fo
 
 For an agent-owned offscreen desktop, install `Xvfb` and `openbox` on `PATH`,
 register `cu mcp` as described below, then call
-`computer_connect({"type":"private"})`. cu starts and owns the Xvfb/Openbox
+`computer_connect({"name":"@private"})`. cu starts and owns the Xvfb/Openbox
 desktop; no systemd configuration or separately started daemon is needed.
 
 To connect to an existing desktop instead, start a daemon:
@@ -190,10 +190,10 @@ claude mcp add --scope user --transport stdio cu -- cu mcp
 
 It exposes four tools:
 
-- `computer_connect` requires `type` (`private`, `default`, or `named`) and
-  returns `{instance, profile}`. `private` creates or reuses this MCP process's
-  desktop; `default` selects the default daemon; `named` requires `name` to
-  select an existing named daemon.
+- `computer_connect` accepts one optional string `name`, defaulting to
+  `"@default"`, and returns `{profile}`. `"@default"` selects the existing
+  default daemon; `"@private"` creates or reuses this MCP process's session-local
+  offscreen desktop; other names select existing named daemons.
 - `computer_observe` returns a session-local integer `frame`, dimensions,
   settling status, and a PNG image.
 - `computer_act` requires that latest `frame`, executes a validated batch, and
@@ -209,14 +209,17 @@ errors include a diagnostic and applicable next steps, while partial or screensh
 action results include a `message`. Ordinary successful action results omit it.
 
 MCP starts disconnected. Call `computer_connect` before observing, acting, or
-waiting; otherwise these tools return `not_connected`. The three request forms
-are `{"type":"private"}`, `{"type":"default"}`, and
-`{"type":"named","name":"work"}`. Only `named` accepts `name`, which must be
-a valid nonempty instance name. Names `default` and `private` are also allowed:
-`{"type":"named","name":"default"}` selects `instances/default`, independently
-of `{"type":"default"}`. Unknown fields and the old `{"instance":"..."}`
-request shape are rejected. The returned `instance` is the target label
-(`private`, `default`, or its name); interpret it together with the request's `type`.
+waiting; otherwise these tools return `not_connected`. Call with `{}` or
+`{"name":"@default"}` for the default daemon, `{"name":"@private"}` for a
+private desktop, or `{"name":"work"}` for an existing named daemon. The default
+applies only when calling the tool; MCP startup does not connect automatically.
+Switching away from a private desktop preserves it until its MCP process exits.
+Literal names `default` and `private` are ordinary instance names:
+`{"name":"default"}` selects `instances/default`, independently of `@default`.
+Instance names use 1-64 ASCII letters, digits, dots, underscores, or hyphens;
+`.` and `..` are invalid. Null or empty names, unknown `@` selectors, and extra
+fields (including the former `type` and `instance` parameters) are rejected
+without changing the current connection or cancelling waits.
 
 Find candidate named instances with:
 
@@ -225,12 +228,10 @@ ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances"
 ```
 
 Directories may remain after a daemon exits; connecting checks availability.
-There is no separate instance registry or list command. `cu mcp --instance`
-and `cu mcp --socket` have been removed; select the instance through the tool.
-CLI commands still support their daemon targeting options. Omit `--instance`
-for the default daemon; an explicit `--instance NAME` always selects
-`instances/NAME`, including names `default` and `private`. Existing commands
-using `--instance default` for the default daemon should omit that option.
+There is no separate instance registry or list command. Select the MCP desktop
+through `computer_connect`. CLI commands use their daemon targeting options:
+omit `--instance` for the default daemon; an explicit `--instance NAME` always selects
+`instances/NAME`, including names `default` and `private`.
 
 Every valid connect attempt cancels this MCP's synchronous and asynchronous
 waits, clears its current frame and action retry cache, and requires a fresh

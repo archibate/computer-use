@@ -5,6 +5,7 @@ mod wait;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -42,50 +43,52 @@ const PROFILE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_MCP_CACHED_ACTIONS: usize = 64;
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-#[schemars(extend("type" = "object"))]
-enum McpConnectRequest {
-    /// Create or reuse this MCP process's offscreen Xvfb/Openbox desktop.
-    /// Switching away preserves it until this MCP exits.
-    Private {},
-    /// Connect to the existing default daemon.
-    Default {},
-    /// Connect to an existing named daemon.
-    Named {
-        /// Instance directory name.
-        /// Find candidate names with: ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances".
-        #[serde(deserialize_with = "deserialize_named_instance")]
-        #[schemars(
-            with = "String",
-            length(min = 1, max = 64),
-            regex(pattern = "^[A-Za-z0-9_.-]+$")
-        )]
-        name: crate::InstanceName,
-    },
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpConnectRequest {
+    /// @default (the default when omitted) connects to the existing default daemon.
+    /// @private creates or reuses this MCP process's session-local offscreen Xvfb/Openbox desktop;
+    /// switching away preserves it until this MCP process exits.
+    /// Other values select existing named daemons, including literal names default and private.
+    /// Instance names use 1-64 ASCII letters, digits, dots, underscores, or hyphens; . and .. are invalid.
+    /// Find candidate names with: ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances".
+    #[serde(default = "default_connect_name")]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = "^(@default|@private|[A-Za-z0-9_.-]+)$")
+    )]
+    name: String,
 }
 
-fn deserialize_named_instance<'de, D>(deserializer: D) -> Result<crate::InstanceName, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let name = String::deserialize(deserializer)?;
-    name.parse().map_err(serde::de::Error::custom)
+fn default_connect_name() -> String {
+    "@default".to_owned()
 }
 
-impl McpConnectRequest {
-    fn instance(&self) -> &str {
-        match self {
-            Self::Private {} => "private",
-            Self::Default {} => "default",
-            Self::Named { name } => &name.0,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectionTarget {
+    Default,
+    Private,
+    Named(crate::InstanceName),
+}
+
+impl FromStr for ConnectionTarget {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "@default" => Ok(Self::Default),
+            "@private" => Ok(Self::Private),
+            _ => name.parse().map(Self::Named).map_err(|error| {
+                format!(
+                    "invalid name: use @default, @private, or an existing instance name; {error}"
+                )
+            }),
         }
     }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct McpConnection {
-    instance: String,
     /// Connection details and trusted operating guidance for this desktop.
     profile: String,
 }
@@ -93,7 +96,7 @@ struct McpConnection {
 #[derive(Debug, Clone)]
 struct Connection {
     socket: PathBuf,
-    target: McpConnectRequest,
+    target: ConnectionTarget,
     generation: Uuid,
     cancelled: CancellationToken,
 }
@@ -125,11 +128,13 @@ struct McpWaitRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 8))]
     exclude_rects: Vec<Rect>,
-    /// Total budget for detection and post-change settling.
+    /// Total budget in milliseconds for detection and post-change settling.
+    /// Defaults to 3600000 (1 hour); range 1-3600000.
     #[serde(default = "default_wait_timeout_ms")]
     #[schemars(range(min = 1, max = 3_600_000))]
     timeout_ms: u64,
-    /// Required continuous stability after activity.
+    /// Required continuous stability after activity, in milliseconds.
+    /// Defaults to 2000 (2 seconds); range 1-60000.
     #[serde(default = "default_wait_quiet_ms")]
     #[schemars(range(min = 1, max = 60_000))]
     quiet_ms: u64,
@@ -505,21 +510,25 @@ impl ComputerUseMcp {
         Parameters(request): Parameters<McpConnectRequest>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let private = matches!(&request, McpConnectRequest::Private {});
+        let target = match request.name.parse::<ConnectionTarget>() {
+            Ok(target) => target,
+            Err(error) => return Ok(CallToolResult::error(vec![ContentBlock::text(error)])),
+        };
+        let private = matches!(&target, ConnectionTarget::Private);
         let mut state = self.state.lock().await;
         if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
             return Ok(cancelled_connect_result());
         }
         state.disconnect();
         self.waits.cancel().await;
-        let (socket, created) = match &request {
-            McpConnectRequest::Default {} => (crate::default_runtime_dir().join("cu.sock"), false),
-            McpConnectRequest::Named { name } => {
+        let (socket, created) = match &target {
+            ConnectionTarget::Default => (crate::default_runtime_dir().join("cu.sock"), false),
+            ConnectionTarget::Named(name) => {
                 (crate::named_instance_dir(name).join("cu.sock"), false)
             }
-            McpConnectRequest::Private {} => match self.desktop.launch() {
+            ConnectionTarget::Private => match self.desktop.launch() {
                 Ok(result) => result,
-                Err(error) => return Ok(connection_error(&request, &error)),
+                Err(error) => return Ok(connection_error(&target, &error)),
             },
         };
         let connecting = async {
@@ -552,12 +561,11 @@ impl ComputerUseMcp {
             Ok(profile) if !context.ct.is_cancelled() && !self.shutdown.is_cancelled() => {
                 state.connection = Some(Connection {
                     socket,
-                    target: request.clone(),
+                    target,
                     generation: Uuid::new_v4(),
                     cancelled: self.shutdown.child_token(),
                 });
                 Ok(structured_result(McpConnection {
-                    instance: request.instance().to_owned(),
                     profile: profile.unwrap_or_default(),
                 }))
             }
@@ -569,7 +577,7 @@ impl ComputerUseMcp {
                     Ok(cancelled_connect_result())
                 } else {
                     Ok(connection_error(
-                        &request,
+                        &target,
                         &result.expect_err("successful connection handled above"),
                     ))
                 }
@@ -741,7 +749,7 @@ impl ComputerUseMcp {
     }
 
     #[tool(
-        description = "Execute 1 to 16 sequential input actions grounded in the supplied session-local frame number. Coordinates are pixels in that frame. Returns execution metadata plus a fresh numbered observation and PNG; batch only actions whose intermediate UI does not require inspection.",
+        description = "Execute sequential input actions on the live desktop and return execution metadata, a fresh frame, and PNG. Batch only when no intermediate inspection is needed.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<McpActOutcome>(),
         annotations(
             title = "Act on computer",
@@ -1086,18 +1094,18 @@ fn connected(state: &McpSessionState) -> Result<Connection, CallToolResult> {
     state.connection.clone().ok_or_else(|| {
         CallToolResult::structured_error(json!({
             "code": "not_connected",
-            "message": "call computer_connect with type private, default, or named before using the desktop",
+            "message": "call computer_connect before using the desktop; omit name for @default, or set name to @private or an existing instance name",
         }))
     })
 }
 
-fn connection_error(target: &McpConnectRequest, error: &anyhow::Error) -> CallToolResult {
+fn connection_error(target: &ConnectionTarget, error: &anyhow::Error) -> CallToolResult {
     let message = match target {
-        McpConnectRequest::Private {} => format!(
-            "private desktop unavailable: {error:#}; call computer_connect with type private to retry"
+        ConnectionTarget::Private => format!(
+            "private desktop unavailable: {error:#}; call computer_connect with name @private to retry"
         ),
-        McpConnectRequest::Default {} => format!("default daemon unavailable: {error:#}"),
-        McpConnectRequest::Named { name } => {
+        ConnectionTarget::Default => format!("default daemon unavailable: {error:#}"),
+        ConnectionTarget::Named(name) => {
             format!("named instance {name} unavailable: {error:#}")
         }
     };
@@ -1292,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn initialization_requires_connection_and_connect_exposes_three_object_shapes() {
+    fn initialization_requires_connection_and_connect_exposes_one_optional_name() {
         let server = ComputerUseMcp::new();
         let instructions = server.get_info().instructions.unwrap();
         assert!(instructions.contains("computer_connect"));
@@ -1300,33 +1308,48 @@ mod tests {
         let connect = tool(&server, "computer_connect");
         let schema = serde_json::to_value(connect.input_schema).unwrap();
         assert_eq!(schema["type"], "object");
-        let branches = schema["oneOf"].as_array().unwrap();
-        assert_eq!(branches.len(), 3);
-        for (branch, kind) in branches.iter().zip(["private", "default", "named"]) {
-            assert_eq!(branch["properties"]["type"]["const"], kind);
-            assert_eq!(branch["additionalProperties"], false);
-            let required = branch["required"].as_array().unwrap();
-            assert!(required.contains(&json!("type")));
-            assert_eq!(required.contains(&json!("name")), kind == "named");
-            assert_eq!(branch["properties"].get("name").is_some(), kind == "named");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        assert!(
+            schema
+                .get("required")
+                .is_none_or(|required| required == &json!([]))
+        );
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            assert!(schema.get(keyword).is_none());
         }
-        let name = &branches[2]["properties"]["name"];
+        let name = &schema["properties"]["name"];
         assert_eq!(name["type"], "string");
+        assert_eq!(name["default"], "@default");
         assert_eq!(name["minLength"], 1);
         assert_eq!(name["maxLength"], 64);
-        assert_eq!(name["pattern"], "^[A-Za-z0-9_.-]+$");
+        assert_eq!(name["pattern"], "^(@default|@private|[A-Za-z0-9_.-]+)$");
+        let description = name["description"].as_str().unwrap();
+        for meaning in [
+            "@default",
+            "when omitted",
+            "@private",
+            "session-local",
+            "exits",
+            "instances",
+        ] {
+            assert!(
+                description.contains(meaning),
+                "name description omits {meaning}"
+            );
+        }
     }
 
     #[test]
-    fn connect_deserializes_validated_tagged_variants() {
-        assert!(matches!(
-            serde_json::from_value::<McpConnectRequest>(json!({"type": "private"})).unwrap(),
-            McpConnectRequest::Private {}
-        ));
-        assert!(matches!(
-            serde_json::from_value::<McpConnectRequest>(json!({"type": "default"})).unwrap(),
-            McpConnectRequest::Default {}
-        ));
+    fn connect_defaults_and_parses_explicit_selectors_and_literal_names() {
+        for (value, expected) in [
+            (json!({}), ConnectionTarget::Default),
+            (json!({"name": "@default"}), ConnectionTarget::Default),
+            (json!({"name": "@private"}), ConnectionTarget::Private),
+        ] {
+            let request = serde_json::from_value::<McpConnectRequest>(value).unwrap();
+            assert_eq!(request.name.parse::<ConnectionTarget>().unwrap(), expected);
+        }
         for expected in [
             "work".to_owned(),
             "default".to_owned(),
@@ -1334,9 +1357,9 @@ mod tests {
             "x11-99.A_1".to_owned(),
             "a".repeat(64),
         ] {
-            let McpConnectRequest::Named { name } =
-                serde_json::from_value(json!({"type": "named", "name": expected})).unwrap()
-            else {
+            let request =
+                serde_json::from_value::<McpConnectRequest>(json!({"name": expected})).unwrap();
+            let ConnectionTarget::Named(name) = request.name.parse().unwrap() else {
                 panic!("expected named target")
             };
             assert_eq!(name.to_string(), expected);
@@ -1344,15 +1367,21 @@ mod tests {
     }
 
     #[test]
-    fn connect_rejects_malformed_tags_names_and_extra_fields() {
+    fn connect_rejects_malformed_arguments_legacy_shapes_and_extra_fields() {
         for value in [
             json!(null),
-            json!([]),
-            json!({}),
+            json!({"name": null}),
+            json!({"name": 42}),
+            json!({"name": []}),
+            json!({"name": {}}),
+            json!({"extra": true}),
+            json!({"name": "@private", "extra": true}),
             json!({"type": null}),
             json!({"type": "work"}),
             json!({"type": "PRIVATE"}),
             json!({"instance": "default"}),
+            json!({"type": "private"}),
+            json!({"type": "default"}),
             json!({"type": "named"}),
             json!({"type": "named", "name": null}),
             json!({"type": "private", "name": "work"}),
@@ -1362,12 +1391,17 @@ mod tests {
             json!({"type": "private", "extra": true}),
             json!({"type": "default", "instance": "work"}),
             json!({"type": "named", "name": "work", "extra": true}),
+            json!({"type": "named", "name": "work"}),
         ] {
             assert!(
                 serde_json::from_value::<McpConnectRequest>(value.clone()).is_err(),
                 "accepted {value}"
             );
         }
+    }
+
+    #[test]
+    fn connection_target_rejects_invalid_names_and_unknown_selectors() {
         for name in [
             "",
             " ",
@@ -1376,13 +1410,11 @@ mod tests {
             "../escape",
             "has/slash",
             "空",
+            "@unknown",
+            "@DEFAULT",
             &"a".repeat(65),
         ] {
-            assert!(
-                serde_json::from_value::<McpConnectRequest>(json!({"type": "named", "name": name}))
-                    .is_err(),
-                "accepted {name}"
-            );
+            assert!(name.parse::<ConnectionTarget>().is_err(), "accepted {name}");
         }
     }
 
@@ -1513,6 +1545,12 @@ mod tests {
         assert_eq!(wait_schema["properties"]["include_rects"]["minItems"], 1);
         assert_eq!(wait_schema["properties"]["include_rects"]["maxItems"], 8);
         assert_eq!(wait_schema["properties"]["exclude_rects"]["maxItems"], 8);
+        for dimension in ["width", "height"] {
+            assert_eq!(
+                wait_schema["$defs"]["Rect"]["properties"][dimension]["minimum"],
+                1
+            );
+        }
         assert_eq!(
             wait_schema["properties"]["timeout_ms"]["maximum"],
             3_600_000
@@ -1567,7 +1605,7 @@ mod tests {
         let server = ComputerUseMcp::new();
         let connection = Connection {
             socket: directory.path().join("missing.sock"),
-            target: McpConnectRequest::Default {},
+            target: ConnectionTarget::Default,
             generation: Uuid::new_v4(),
             cancelled: CancellationToken::new(),
         };

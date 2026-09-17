@@ -45,8 +45,10 @@ pub struct Rect {
     /// Vertical offset of the top edge.
     pub y: u32,
     /// Positive rectangle width.
+    #[schemars(range(min = 1))]
     pub width: u32,
     /// Positive rectangle height.
+    #[schemars(range(min = 1))]
     pub height: u32,
 }
 
@@ -114,9 +116,9 @@ pub enum Action {
         /// Vertical frame pixel at which to scroll.
         #[schemars(range(min = 0))]
         y: i32,
-        /// Signed horizontal scroll delta; positive is right and negative is left.
+        /// Signed horizontal scroll delta in pixels; positive is right and negative is left.
         scroll_x: i32,
-        /// Signed vertical scroll delta; positive is down and negative is up.
+        /// Signed vertical scroll delta in pixels; positive is down and negative is up.
         scroll_y: i32,
         /// Keys held during scrolling, normally modifiers such as `CTRL` or `SHIFT`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -130,7 +132,7 @@ pub enum Action {
     },
     /// Press all listed keys in order as one chord, then release them in reverse order.
     Keypress {
-        /// Between 1 and 16 case-insensitive names: ALT, BACKSPACE, CTRL, DELETE, arrows,
+        /// Between 1 and 16 case-insensitive names: ALT, BACKSPACE, CTRL, DELETE, UP/DOWN/LEFT/RIGHT,
         /// END, ENTER, ESC, F1-F12, HOME, META/SUPER, PAGEDOWN, PAGEUP, SHIFT, SPACE,
         /// TAB, or one Unicode character. Examples: `["CTRL", "L"]` and `["ENTER"]`.
         #[schemars(length(min = 1, max = 16))]
@@ -824,6 +826,30 @@ mod tests {
             validate_wait_request(&request, viewport).unwrap_err().code,
             ErrorCode::InvalidAction
         );
+    }
+
+    #[test]
+    fn rectangles_require_positive_dimensions_but_allow_zero_offsets() {
+        let viewport = Viewport {
+            width: 100,
+            height: 80,
+        };
+        for (width, height, valid) in [(0, 1, false), (1, 0, false), (1, 1, true), (100, 80, true)]
+        {
+            let request = WaitRequest {
+                last_frame_id: "f_latest".to_owned(),
+                include_rects: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+                exclude_rects: Vec::new(),
+                timeout_ms: 1_000,
+                quiet_ms: 100,
+            };
+            assert_eq!(validate_wait_request(&request, viewport).is_ok(), valid);
+        }
     }
 
     #[test]

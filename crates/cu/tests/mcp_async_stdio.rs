@@ -701,13 +701,45 @@ fn desktop_operations_require_an_explicit_connection() {
         "unconnected MCP contacted a daemon"
     );
     for (id, arguments) in [
-        (6, json!({})),
+        (6, json!({"name": null})),
         (7, json!({"type": null})),
-        (8, json!({"type": "named", "name": ""})),
+        (8, json!({"name": ""})),
     ] {
         mcp.call(id, "computer_connect", arguments);
         let response = mcp.response(id);
         assert!(response.get("error").is_some() || response["result"]["isError"] == true);
+    }
+    mcp.close();
+}
+
+#[test]
+#[ignore = "requires local Unix socket access"]
+fn omitted_and_explicit_default_names_connect_to_the_default_daemon() {
+    let mut mcp = McpFixture::initialized();
+    for (id, params) in [
+        (2, json!({"name": "computer_connect", "arguments": {}})),
+        (
+            3,
+            json!({"name": "computer_connect", "arguments": {"name": "@default"}}),
+        ),
+        (4, json!({"name": "computer_connect"})),
+    ] {
+        mcp.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params}));
+        let profile = mcp.daemon_call();
+        assert!(matches!(profile.request.request, DaemonRequest::Profile));
+        profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(
+            "default daemon".to_owned(),
+        ))));
+        assert_eq!(
+            mcp.response(id)["result"]["structuredContent"],
+            json!({"profile": "default daemon"})
+        );
+        assert!(
+            !mcp.directory
+                .path()
+                .join("computer-use/mcp-desktops")
+                .exists()
+        );
     }
     mcp.close();
 }
@@ -725,11 +757,18 @@ fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
         json!({"type": "private", "name": "work"}),
         json!({"type": "default", "name": null}),
         json!({"type": "named"}),
-        json!({"type": "named", "name": ""}),
-        json!({"type": "named", "name": "../escape"}),
-        json!({"type": "named", "name": "."}),
-        json!({"type": "named", "name": ".."}),
-        json!({"type": "named", "name": "work", "extra": true}),
+        json!({"type": "default"}),
+        json!({"type": "private"}),
+        json!({"type": "named", "name": "work"}),
+        json!({"name": null}),
+        json!({"name": ""}),
+        json!({"name": "../escape"}),
+        json!({"name": "."}),
+        json!({"name": ".."}),
+        json!({"name": "@unknown"}),
+        json!({"name": "has/slash"}),
+        json!({"name": "a".repeat(65)}),
+        json!({"name": "@private", "extra": true}),
     ]
     .into_iter()
     .enumerate()
@@ -738,11 +777,10 @@ fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
         mcp.call(id, "computer_connect", arguments);
         let response = mcp.response(id);
         assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            response["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("failed to deserialize parameters")
+            message.contains("failed to deserialize parameters")
+                || message.contains("invalid name")
         );
         assert!(!signal.exists(), "invalid connect cancelled the wait");
         assert!(
@@ -750,12 +788,18 @@ fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
             "invalid connect contacted a daemon"
         );
     }
+    assert!(
+        !mcp.directory
+            .path()
+            .join("computer-use/mcp-desktops")
+            .exists()
+    );
     waiting.respond(ResponseResult::Ok(DaemonResponse::Wait(
         WaitOutcome::Timeout { elapsed_ms: 1 },
     )));
     assert_eq!(terminal_result(&signal)["status"], "timeout");
     mcp.call(
-        20,
+        100,
         "computer_act",
         json!({"frame": 1, "actions": [{"type": "keypress", "keys": ["A"]}]}),
     );
@@ -764,7 +808,7 @@ fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
             mcp.action_outcome("acted"),
         )));
     assert_eq!(
-        mcp.response(20)["result"]["structuredContent"]["observation"]["frame"],
+        mcp.response(100)["result"]["structuredContent"]["observation"]["frame"],
         2
     );
     mcp.close();
@@ -775,11 +819,7 @@ fn invalid_connect_requests_preserve_connection_frame_and_pending_wait() {
 fn named_default_and_private_are_independent_daemon_names() {
     for name in ["default", "private"] {
         let mut mcp = McpFixture::new();
-        mcp.call(
-            2,
-            "computer_connect",
-            json!({"type": "named", "name": name}),
-        );
+        mcp.call(2, "computer_connect", json!({"name": name}));
         let error = mcp.response(2);
         assert_eq!(
             error["result"]["structuredContent"]["code"],
@@ -789,15 +829,11 @@ fn named_default_and_private_are_independent_daemon_names() {
             .as_str()
             .unwrap();
         assert!(message.contains(&format!("cu daemon --instance {name}")));
-        assert!(!message.contains("type private"));
+        assert!(!message.contains("name @private"));
         assert!(mcp.listener.accept().is_err());
 
         let default_listener = mcp.replace_listener(name);
-        mcp.call(
-            3,
-            "computer_connect",
-            json!({"type": "named", "name": name}),
-        );
+        mcp.call(3, "computer_connect", json!({"name": name}));
         let profile = mcp.daemon_call();
         assert!(matches!(profile.request.request, DaemonRequest::Profile));
         profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(format!(
@@ -817,7 +853,7 @@ fn named_default_and_private_are_independent_daemon_names() {
         );
 
         let named_listener = std::mem::replace(&mut mcp.listener, default_listener);
-        mcp.connect(4, "default");
+        mcp.connect(4, "@default");
         assert!(named_listener.accept().is_err());
         mcp.close();
     }
@@ -881,7 +917,7 @@ fn reconnect_cancels_async_wait_and_requires_another_observation() {
     mcp.observe(2, "baseline");
     let signal = mcp.start_wait(3, 1);
     let waiting = mcp.daemon_call();
-    mcp.connect(4, "default");
+    mcp.connect(4, "@default");
     waiting.assert_closed();
     let cancelled = terminal_result(&signal);
     assert_eq!(cancelled["status"], "cancelled");
@@ -908,7 +944,7 @@ fn connect_actively_cancels_a_synchronous_wait_on_an_unchanged_daemon() {
     mcp.observe(2, "baseline");
     mcp.call(3, "computer_wait", wait_arguments(1, false));
     let waiting = mcp.daemon_call();
-    mcp.call(4, "computer_connect", json!({"type": "default"}));
+    mcp.call(4, "computer_connect", json!({}));
     let profile = mcp.daemon_call();
     waiting.assert_closed();
     profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(
@@ -932,11 +968,7 @@ fn connect_actively_cancels_a_synchronous_wait_on_an_unchanged_daemon() {
 fn failed_or_cancelled_connect_stays_disconnected() {
     let mut mcp = McpFixture::new();
     mcp.observe(2, "baseline");
-    mcp.call(
-        3,
-        "computer_connect",
-        json!({"type": "named", "name": "missing"}),
-    );
+    mcp.call(3, "computer_connect", json!({"name": "missing"}));
     assert_eq!(
         mcp.response(3)["result"]["structuredContent"]["code"],
         "daemon_unavailable"
@@ -947,7 +979,7 @@ fn failed_or_cancelled_connect_stays_disconnected() {
         "not_connected"
     );
     assert!(mcp.listener.accept().is_err());
-    mcp.call(5, "computer_connect", json!({"type": "default"}));
+    mcp.call(5, "computer_connect", json!({"name": "@default"}));
     let pending = mcp.daemon_call();
     mcp.send(
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 5}}),
@@ -974,26 +1006,17 @@ struct McpFixture {
 }
 
 impl McpFixture {
-    fn connect(&mut self, id: u64, instance: &str) {
-        let arguments = if instance == "default" {
-            json!({"type": "default"})
-        } else {
-            json!({"type": "named", "name": instance})
-        };
-        self.call(id, "computer_connect", arguments);
+    fn connect(&mut self, id: u64, name: &str) {
+        self.call(id, "computer_connect", json!({"name": name}));
         let profile = self.daemon_call();
         assert!(matches!(profile.request.request, DaemonRequest::Profile));
         profile.respond(ResponseResult::Ok(DaemonResponse::Profile(Some(format!(
-            "profile for {instance}"
+            "profile for {name}"
         )))));
         let response = self.response(id);
         assert_eq!(
-            response["result"]["structuredContent"]["instance"],
-            instance
-        );
-        assert_eq!(
-            response["result"]["structuredContent"]["profile"],
-            format!("profile for {instance}")
+            response["result"]["structuredContent"],
+            json!({"profile": format!("profile for {name}")})
         );
     }
 
@@ -1023,13 +1046,13 @@ impl McpFixture {
 
     fn new() -> Self {
         let mut fixture = Self::initialized();
-        fixture.call(0, "computer_connect", json!({"type": "default"}));
+        fixture.call(0, "computer_connect", json!({}));
         let profile = fixture.daemon_call();
         assert!(matches!(profile.request.request, DaemonRequest::Profile));
         profile.respond(ResponseResult::Ok(DaemonResponse::Profile(None)));
         assert_eq!(
-            fixture.response(0)["result"]["structuredContent"]["instance"],
-            "default"
+            fixture.response(0)["result"]["structuredContent"],
+            json!({"profile": ""})
         );
         fixture
     }

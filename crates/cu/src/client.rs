@@ -46,7 +46,7 @@ fn connection_error(socket: &Path, error: &io::Error) -> anyhow::Error {
             .is_some_and(|name| name == "mcp-desktops")
     {
         return anyhow!(
-            "{summary}\ncall computer_connect with type private to recreate its desktop"
+            "{summary}\ncall computer_connect with name @private to recreate its desktop"
         );
     }
     let start_command = named_instance_from_socket(socket).map_or_else(
@@ -105,7 +105,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("computer_connect with type private")
+                .contains("computer_connect with name @private")
         );
         assert!(!error.to_string().contains("cu daemon"));
     }

@@ -80,6 +80,11 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
     assert!(!published.contains("frame_id"));
     assert!(!published.contains("expected_frame_id"));
     let tools = tools_response["result"]["tools"].as_array().unwrap();
+    let connect = tools
+        .iter()
+        .find(|tool| tool["name"] == "computer_connect")
+        .unwrap();
+    assert_connect_schema(connect);
     let observe = tools
         .iter()
         .find(|tool| tool["name"] == "computer_observe")
@@ -105,6 +110,28 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
     assert_eq!(
         wait["outputSchema"]["$defs"]["McpWaitOutcome"]["properties"]["elapsed_ms"]["type"],
         "integer"
+    );
+}
+
+fn assert_connect_schema(connect: &serde_json::Value) {
+    let input = &connect["inputSchema"];
+    assert_eq!(input["type"], "object");
+    assert_eq!(input["additionalProperties"], false);
+    assert_eq!(input["properties"].as_object().unwrap().len(), 1);
+    assert_eq!(input["properties"]["name"]["type"], "string");
+    assert_eq!(input["properties"]["name"]["default"], "@default");
+    assert!(
+        input
+            .get("required")
+            .is_none_or(|required| required == &serde_json::json!([]))
+    );
+    assert!(input.get("oneOf").is_none());
+    let output_properties = connect["outputSchema"]["properties"].as_object().unwrap();
+    assert_eq!(output_properties.len(), 1);
+    assert_eq!(output_properties["profile"]["type"], "string");
+    assert_eq!(
+        connect["outputSchema"]["required"],
+        serde_json::json!(["profile"])
     );
 }
 
@@ -212,16 +239,12 @@ fn observe_timeout_and_changed_wait_form_one_mcp_frame_sequence() {
     writeln!(
         stdin,
         "{}",
-        tool_call(
-            0,
-            "computer_connect",
-            &serde_json::json!({"type": "default"})
-        )
+        tool_call(0, "computer_connect", &serde_json::json!({}))
     )
     .unwrap();
     assert_eq!(
-        read_mcp_response(&mut stdout)["result"]["structuredContent"]["instance"],
-        "default"
+        read_mcp_response(&mut stdout)["result"]["structuredContent"],
+        serde_json::json!({"profile": ""})
     );
     writeln!(
         stdin,
@@ -344,13 +367,13 @@ fn mcp_cancellation_disconnects_the_inflight_daemon_wait() {
         tool_call(
             0,
             "computer_connect",
-            &serde_json::json!({"type": "default"})
+            &serde_json::json!({"name": "@default"})
         )
     )
     .unwrap();
     assert_eq!(
-        read_mcp_response(&mut stdout)["result"]["structuredContent"]["instance"],
-        "default"
+        read_mcp_response(&mut stdout)["result"]["structuredContent"],
+        serde_json::json!({"profile": ""})
     );
     writeln!(
         stdin,
