@@ -1639,6 +1639,7 @@ mod tests {
         assert!(message.contains("start it separately, then retry"));
         assert!(message.contains("`cu daemon`"));
         assert!(message.contains("`cu daemon --help`"));
+        assert!(message.contains("computer_connect with name @private"));
     }
 
     #[tokio::test]

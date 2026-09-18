@@ -49,13 +49,14 @@ fn connection_error(socket: &Path, error: &io::Error) -> anyhow::Error {
             "{summary}\ncall computer_connect with name @private to recreate its desktop"
         );
     }
-    let start_command = named_instance_from_socket(socket).map_or_else(
-        || "`cu daemon`".to_owned(),
-        |instance| format!("`cu daemon --instance {instance}`"),
-    );
-    anyhow!(
-        "{summary}\nstart it separately, then retry: {start_command} (auto-detects the desktop); use `cu daemon --help` for an explicit backend override"
-    )
+    match named_instance_from_socket(socket) {
+        Some(instance) => anyhow!(
+            "{summary}\nstart it separately, then retry: `cu daemon --instance {instance}` (auto-detects the desktop); use `cu daemon --help` for an explicit backend override"
+        ),
+        None => anyhow!(
+            "{summary}\nstart it separately, then retry: `cu daemon` (auto-detects the desktop); use `cu daemon --help` for an explicit backend override\nif a session-local offscreen desktop is suitable, call computer_connect with name @private instead"
+        ),
+    }
 }
 
 fn named_instance_from_socket(socket: &Path) -> Option<&str> {
@@ -84,6 +85,7 @@ mod tests {
         assert!(message.contains("start it separately, then retry"));
         assert!(message.contains("`cu daemon`"));
         assert!(message.contains("`cu daemon --help`"));
+        assert!(message.contains("computer_connect with name @private"));
     }
 
     #[test]
@@ -93,7 +95,9 @@ mod tests {
             &io::Error::from(io::ErrorKind::NotFound),
         );
 
-        assert!(error.to_string().contains("`cu daemon --instance x11-99`"));
+        let message = error.to_string();
+        assert!(message.contains("`cu daemon --instance x11-99`"));
+        assert!(!message.contains("name @private"));
     }
 
     #[test]
