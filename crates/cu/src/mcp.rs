@@ -49,9 +49,8 @@ struct McpConnectRequest {
     /// @default (the default when omitted) connects to the existing default daemon.
     /// @private creates or reuses this MCP process's session-local offscreen Xvfb/Openbox desktop;
     /// switching away preserves it until this MCP process exits.
-    /// Other values select existing named daemons, including literal names default and private.
-    /// Instance names use 1-64 ASCII letters, digits, dots, underscores, or hyphens; . and .. are invalid.
-    /// Find candidate names with: ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances".
+    /// Other values select existing named daemons. Find candidate names with:
+    /// ls "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/computer-use/instances".
     #[serde(default = "default_connect_name")]
     #[schemars(
         length(min = 1, max = 64),
@@ -246,7 +245,17 @@ struct McpActOutcome {
     observation: Option<McpObservation>,
     /// Guidance specific to this result.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = type_array_as_any_of)]
     message: Option<&'static str>,
+}
+
+// Some MCP clients require each `type` value to be a single string.
+fn type_array_as_any_of(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(types)) = schema.get("type") {
+        let variants: Vec<_> = types.iter().map(|ty| json!({"type": ty})).collect();
+        schema.remove("type");
+        schema.insert("anyOf".to_owned(), json!(variants));
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -501,7 +510,7 @@ impl ComputerUseMcp {
     }
 
     #[tool(
-        description = "Connect to a desktop. Every valid connection attempt cancels pending waits and invalidates previous frames; call computer_observe afterward.",
+        description = "Connect to a desktop. Every valid connection attempt invalidates previous frames; call computer_observe afterward.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<McpConnection>(),
         annotations(title = "Connect computer", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]

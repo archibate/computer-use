@@ -93,6 +93,7 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
         .iter()
         .find(|tool| tool["name"] == "computer_act")
         .unwrap();
+    assert_action_message_schema(act);
     let wait = tools
         .iter()
         .find(|tool| tool["name"] == "computer_wait")
@@ -110,6 +111,23 @@ fn initializes_and_publishes_compact_frame_schemas_without_a_daemon() {
     assert_eq!(
         wait["outputSchema"]["$defs"]["McpWaitOutcome"]["properties"]["elapsed_ms"]["type"],
         "integer"
+    );
+}
+
+fn assert_action_message_schema(act: &serde_json::Value) {
+    let output = &act["outputSchema"];
+    let message = &output["properties"]["message"];
+    assert!(message.get("type").is_none());
+    assert_eq!(
+        message["anyOf"],
+        serde_json::json!([{"type": "string"}, {"type": "null"}])
+    );
+    assert!(
+        !output["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "message")
     );
 }
 
