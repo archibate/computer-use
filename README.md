@@ -140,6 +140,27 @@ Coordinates are pixels in the returned, possibly downscaled frame. Supported
 actions are `move`, `click`, `double_click`, `drag`, `scroll`, `type`, and
 `keypress`. A batch contains at most 16 actions.
 
+`click.duration_ms` optionally holds the button before releasing it.
+`drag.hold_ms` holds at the first path point before moving, and
+`drag.duration_ms` sets the movement time along the path, excluding that hold.
+Each value is an integer from 0 to 10000 milliseconds. For example:
+
+```json
+[
+  {"type":"click","x":800,"y":450,"duration_ms":600},
+  {"type":"drag","path":[{"x":100,"y":100},{"x":400,"y":200}],"hold_ms":600,"duration_ms":400}
+]
+```
+
+Omitted fields preserve ordinary clicks, zero initial drag hold, and the
+existing drag pacing (move to each subsequent path point, then wait 8 ms).
+Explicit drag duration interpolates along the path at constant speed while
+preserving its corners; zero traverses the points without intentional waits.
+Timing is best effort and includes input and scheduling overhead. These fields
+control input, independently of the post-action `settle` policy. Other actions,
+including double-click, keep their existing timing. Update the daemon and
+CLI/MCP together before using the new fields; older daemons may ignore them.
+
 To wait for screen activity without repeatedly capturing in an agent loop,
 first observe and retain its `frame_id`, then start a bounded wait:
 

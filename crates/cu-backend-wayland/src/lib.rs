@@ -1,5 +1,6 @@
 use std::{sync::Arc, thread, time::Duration};
 
+use cu_core::input::{drag_path, finish_input, with_held_button};
 use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -146,18 +147,24 @@ impl WaylandBackend {
         let mut pressed = Vec::with_capacity(keys.len());
         for key in keys {
             if let Err(error) = self.input.key(key, Direction::Press) {
-                self.release_keys(&pressed);
-                return Err(input_error(error));
+                return finish_input(Err(input_error(error)), self.release_keys(&pressed));
             }
             pressed.push(key);
         }
         Ok(pressed)
     }
 
-    fn release_keys(&mut self, keys: &[Key]) {
+    fn release_keys(&mut self, keys: &[Key]) -> Result<(), CuError> {
+        let mut result = Ok(());
         for key in keys.iter().rev() {
-            let _ = self.input.key(*key, Direction::Release);
+            result = finish_input(
+                result,
+                self.input
+                    .key(*key, Direction::Release)
+                    .map_err(input_error),
+            );
         }
+        result
     }
 
     fn execute_with_modifiers(
@@ -167,8 +174,7 @@ impl WaylandBackend {
     ) -> Result<(), CuError> {
         let pressed = self.press_keys(modifiers)?;
         let result = operation(self);
-        self.release_keys(&pressed);
-        result
+        finish_input(result, self.release_keys(&pressed))
     }
 
     fn click(
@@ -176,34 +182,69 @@ impl WaylandBackend {
         point: Point,
         button: MouseButton,
         viewport: Viewport,
+        duration_ms: u64,
     ) -> Result<(), CuError> {
         self.move_pointer(point, viewport)?;
-        self.input
-            .button(map_button(button), Direction::Click)
-            .map_err(input_error)
+        if duration_ms == 0 {
+            return self
+                .input
+                .button(map_button(button), Direction::Click)
+                .map_err(input_error);
+        }
+        with_held_button(
+            self,
+            |this, down| {
+                this.input
+                    .button(
+                        map_button(button),
+                        if down {
+                            Direction::Press
+                        } else {
+                            Direction::Release
+                        },
+                    )
+                    .map_err(input_error)
+            },
+            |_| {
+                thread::sleep(Duration::from_millis(duration_ms));
+                Ok(())
+            },
+        )
     }
 
     fn keypress(&mut self, names: &[String]) -> Result<(), CuError> {
         let pressed = self.press_keys(names)?;
-        self.release_keys(&pressed);
-        Ok(())
+        self.release_keys(&pressed)
     }
 
-    fn drag(&mut self, path: &[Point], viewport: Viewport) -> Result<(), CuError> {
+    fn drag(
+        &mut self,
+        path: &[Point],
+        viewport: Viewport,
+        hold_ms: u64,
+        duration_ms: Option<u64>,
+    ) -> Result<(), CuError> {
         self.move_pointer(path[0], viewport)?;
-        self.input
-            .button(Button::Left, Direction::Press)
-            .map_err(input_error)?;
-        let result = path[1..].iter().try_for_each(|point| {
-            self.move_pointer(*point, viewport)?;
-            thread::sleep(Duration::from_millis(8));
-            Ok(())
-        });
-        let release = self
-            .input
-            .button(Button::Left, Direction::Release)
-            .map_err(input_error);
-        result.and(release)
+        with_held_button(
+            self,
+            |this, down| {
+                this.input
+                    .button(
+                        Button::Left,
+                        if down {
+                            Direction::Press
+                        } else {
+                            Direction::Release
+                        },
+                    )
+                    .map_err(input_error)
+            },
+            |this| {
+                drag_path(path, hold_ms, duration_ms, |point| {
+                    this.move_pointer(point, viewport)
+                })
+            },
+        )
     }
 }
 
@@ -244,18 +285,29 @@ impl Desktop for WaylandBackend {
             Action::Move { x, y, keys } => self.execute_with_modifiers(keys, |this| {
                 this.move_pointer(Point { x: *x, y: *y }, viewport)
             }),
-            Action::Click { x, y, button, keys } => self.execute_with_modifiers(keys, |this| {
-                this.click(Point { x: *x, y: *y }, *button, viewport)
+            Action::Click {
+                x,
+                y,
+                button,
+                keys,
+                duration_ms,
+            } => self.execute_with_modifiers(keys, |this| {
+                this.click(Point { x: *x, y: *y }, *button, viewport, *duration_ms)
             }),
             Action::DoubleClick { x, y, keys } => self.execute_with_modifiers(keys, |this| {
                 let point = Point { x: *x, y: *y };
-                this.click(point, MouseButton::Left, viewport)?;
+                this.click(point, MouseButton::Left, viewport, 0)?;
                 thread::sleep(Duration::from_millis(60));
-                this.click(point, MouseButton::Left, viewport)
+                this.click(point, MouseButton::Left, viewport, 0)
             }),
-            Action::Drag { path, keys } => {
-                self.execute_with_modifiers(keys, |this| this.drag(path, viewport))
-            }
+            Action::Drag {
+                path,
+                keys,
+                hold_ms,
+                duration_ms,
+            } => self.execute_with_modifiers(keys, |this| {
+                this.drag(path, viewport, *hold_ms, *duration_ms)
+            }),
             Action::Scroll {
                 x,
                 y,

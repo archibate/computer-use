@@ -1,3 +1,5 @@
+pub mod input;
+
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
@@ -1915,6 +1917,7 @@ mod tests {
                     x: 20,
                     y: 30,
                     button: MouseButton::Left,
+                    duration_ms: 0,
                     keys: Vec::new(),
                 }],
                 settle: SettlePolicy::default(),
@@ -1999,6 +2002,7 @@ mod tests {
                         x: 20,
                         y: 30,
                         button: MouseButton::Left,
+                        duration_ms: 0,
                         keys: Vec::new(),
                     },
                     Action::Keypress {
@@ -2013,6 +2017,38 @@ mod tests {
             panic!("expected unsupported input error");
         };
         assert_eq!(error.code, ErrorCode::UnsupportedInput);
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_action_time_rejects_the_whole_batch_before_input() {
+        let directory = TempDir::new().unwrap();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine(&directory, vec![frame(1), frame(1)], Arc::clone(&executed));
+        let observation = observe(&mut engine);
+        let response = engine.handle(RequestEnvelope {
+            request_id: "invalid-action-time".to_owned(),
+            request: DaemonRequest::Act(ActRequest {
+                expected_frame_id: observation.frame_id,
+                actions: vec![
+                    Action::Type {
+                        text: "must not run".to_owned(),
+                    },
+                    Action::Click {
+                        x: 20,
+                        y: 30,
+                        button: MouseButton::Left,
+                        duration_ms: cu_protocol::MAX_ACTION_TIME_MS + 1,
+                        keys: Vec::new(),
+                    },
+                ],
+                settle: SettlePolicy::default(),
+            }),
+        });
+        let ResponseResult::Error(error) = response.result else {
+            panic!("expected invalid action")
+        };
+        assert_eq!(error.code, ErrorCode::InvalidAction);
         assert!(executed.lock().unwrap().is_empty());
     }
 

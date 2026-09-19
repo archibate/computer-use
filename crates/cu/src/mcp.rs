@@ -1428,6 +1428,37 @@ mod tests {
     }
 
     #[test]
+    fn publishes_optional_bounded_action_times() {
+        let server = ComputerUseMcp::new();
+        let act = tool(&server, "computer_act");
+        let actions = act.input_schema["$defs"]["Action"]["oneOf"]
+            .as_array()
+            .unwrap();
+        for (kind, fields) in [
+            ("click", &["duration_ms"][..]),
+            ("drag", &["hold_ms", "duration_ms"][..]),
+        ] {
+            let action = actions
+                .iter()
+                .find(|action| action["properties"]["type"]["const"] == kind)
+                .unwrap();
+            for field in fields {
+                assert_eq!(action["properties"][field]["minimum"], 0);
+                assert_eq!(
+                    action["properties"][field]["maximum"],
+                    cu_protocol::MAX_ACTION_TIME_MS
+                );
+                assert!(
+                    !action["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!(field))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn publishes_described_observe_and_action_schemas() {
         let server = ComputerUseMcp::new();
         let observe = tool(&server, "computer_observe");

@@ -8,6 +8,7 @@ pub const MAX_ACTIONS: usize = 16;
 pub const MAX_KEYS: usize = 16;
 pub const MAX_DRAG_POINTS: usize = 256;
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_ACTION_TIME_MS: u64 = 10_000;
 pub const MAX_INCLUDE_RECTS: usize = 8;
 pub const MAX_EXCLUDE_RECTS: usize = 8;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
@@ -80,6 +81,10 @@ pub enum Action {
         /// Button to click; defaults to `left`.
         #[serde(default = "default_mouse_button")]
         button: MouseButton,
+        /// Time in milliseconds to hold the button before releasing it; omitted means an ordinary click.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        #[schemars(range(min = 0, max = 10000))]
+        duration_ms: u64,
         /// Keys held during the click, normally modifiers such as `CTRL` or `SHIFT`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 16))]
@@ -103,6 +108,15 @@ pub enum Action {
         /// Ordered pointer path containing between 2 and 256 frame-pixel points.
         #[schemars(length(min = 2, max = 256))]
         path: Vec<Point>,
+        /// Time in milliseconds to hold at the first point before moving; defaults to zero.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        #[schemars(range(min = 0, max = 10000))]
+        hold_ms: u64,
+        /// Movement time in milliseconds, excluding `hold_ms`. Omitted keeps the backend's
+        /// default pacing; zero traverses the path without intentional waits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(range(min = 0, max = 10000))]
+        duration_ms: Option<u64>,
         /// Keys held for the entire drag, normally modifiers such as `CTRL` or `SHIFT`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 16))]
@@ -142,6 +156,14 @@ pub enum Action {
 
 const fn default_mouse_button() -> MouseButton {
     MouseButton::Left
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a reference"
+)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Visual settling policy applied before an observation is returned.
@@ -587,6 +609,20 @@ pub fn validate_settle_policy(policy: SettlePolicy) -> Result<(), CuError> {
 /// Returns [`CuError`] for invalid coordinates, key names, paths, or text size.
 pub fn validate_action(action: &Action, viewport: Viewport) -> Result<(), CuError> {
     match action {
+        Action::Click { duration_ms, .. } => validate_action_time(*duration_ms, "duration_ms")?,
+        Action::Drag {
+            hold_ms,
+            duration_ms,
+            ..
+        } => {
+            validate_action_time(*hold_ms, "hold_ms")?;
+            if let Some(duration_ms) = duration_ms {
+                validate_action_time(*duration_ms, "duration_ms")?;
+            }
+        }
+        _ => {}
+    }
+    match action {
         Action::Move { x, y, keys }
         | Action::Click { x, y, keys, .. }
         | Action::DoubleClick { x, y, keys }
@@ -594,7 +630,7 @@ pub fn validate_action(action: &Action, viewport: Viewport) -> Result<(), CuErro
             validate_point(Point { x: *x, y: *y }, viewport)?;
             validate_modifier_keys(keys)?;
         }
-        Action::Drag { path, keys } => {
+        Action::Drag { path, keys, .. } => {
             if path.len() < 2 {
                 return Err(CuError::new(
                     ErrorCode::InvalidAction,
@@ -627,6 +663,16 @@ pub fn validate_action(action: &Action, viewport: Viewport) -> Result<(), CuErro
             }
         }
         Action::Keypress { keys } => validate_keys(keys)?,
+    }
+    Ok(())
+}
+
+fn validate_action_time(value: u64, field: &str) -> Result<(), CuError> {
+    if value > MAX_ACTION_TIME_MS {
+        return Err(CuError::new(
+            ErrorCode::InvalidAction,
+            format!("{field} must be between 0 and {MAX_ACTION_TIME_MS} milliseconds"),
+        ));
     }
     Ok(())
 }
@@ -692,12 +738,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_action_times_preserve_legacy_requests_and_explicit_zero() {
+        for json in [
+            serde_json::json!({"type":"click","x":1,"y":2,"button":"left"}),
+            serde_json::json!({"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}]}),
+        ] {
+            let action: Action = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&action).unwrap(), json);
+            validate_action(
+                &action,
+                Viewport {
+                    width: 100,
+                    height: 100,
+                },
+            )
+            .unwrap();
+        }
+        let json = serde_json::json!({"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}],"hold_ms":600,"duration_ms":0});
+        let action: Action = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(action).unwrap(), json);
+    }
+
+    #[test]
+    fn action_time_limits_are_enforced_for_every_field() {
+        let viewport = Viewport {
+            width: 100,
+            height: 100,
+        };
+        for (template, field) in [
+            (
+                serde_json::json!({"type":"click","x":1,"y":2}),
+                "duration_ms",
+            ),
+            (
+                serde_json::json!({"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}]}),
+                "hold_ms",
+            ),
+            (
+                serde_json::json!({"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}]}),
+                "duration_ms",
+            ),
+        ] {
+            for milliseconds in [0, MAX_ACTION_TIME_MS, MAX_ACTION_TIME_MS + 1, u64::MAX] {
+                let mut json = template.clone();
+                json[field] = milliseconds.into();
+                let action: Action = serde_json::from_value(json).unwrap();
+                let result = validate_action(&action, viewport);
+                if milliseconds <= MAX_ACTION_TIME_MS {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().code, ErrorCode::InvalidAction);
+                }
+            }
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("500"),
+            ] {
+                let mut json = template.clone();
+                json[field] = invalid;
+                assert!(serde_json::from_value::<Action>(json).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn rejects_out_of_bounds_click() {
         let error = validate_action(
             &Action::Click {
                 x: 100,
                 y: 50,
                 button: MouseButton::Left,
+                duration_ms: 0,
                 keys: Vec::new(),
             },
             Viewport {
@@ -873,6 +985,8 @@ mod tests {
             validate_action(
                 &Action::Drag {
                     path,
+                    hold_ms: 0,
+                    duration_ms: None,
                     keys: Vec::new(),
                 },
                 Viewport {

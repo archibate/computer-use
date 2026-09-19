@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use cu_core::input::{drag_path, finish_input, with_held_button};
 use cu_core::{CaptureLimits, CapturedFrame, Desktop};
 use cu_protocol::{Action, CuError, ErrorCode, MouseButton, Point, Viewport};
 use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
@@ -28,7 +29,6 @@ use x11rb::{
 use xkeysym::{Keysym, key};
 
 const KEY_DELAY: Duration = Duration::from_millis(12);
-const DRAG_DELAY: Duration = Duration::from_millis(8);
 const KEYMAP_OWNER_ATOM_NAME: &[u8] = b"_COMPUTER_USE_X11_KEYMAP_OWNER_V1";
 const KEYMAP_JOURNAL_ATOM_NAME: &[u8] = b"_COMPUTER_USE_X11_KEYMAP_JOURNAL_V1";
 const KEYMAP_JOURNAL_MAGIC: u32 = 0x4355_4b4d;
@@ -288,9 +288,22 @@ impl X11Backend {
         self.button_event(detail, false)
     }
 
-    fn click(&self, point: Point, button: MouseButton, viewport: Viewport) -> Result<(), CuError> {
+    fn click(
+        &mut self,
+        point: Point,
+        button: MouseButton,
+        viewport: Viewport,
+        duration_ms: u64,
+    ) -> Result<(), CuError> {
         self.move_pointer(point, viewport)?;
-        self.click_button(map_button(button))
+        with_held_button(
+            self,
+            |this, down| this.button_event(map_button(button), down),
+            |_| {
+                thread::sleep(Duration::from_millis(duration_ms));
+                Ok(())
+            },
+        )
     }
 
     fn key_event(&self, keycode: u8, press: bool) -> Result<(), CuError> {
@@ -367,7 +380,7 @@ impl X11Backend {
         let pressed = self.press_keys(modifiers)?;
         let result = operation(self);
         let release = self.release_keys(&pressed);
-        result.and(release)
+        finish_input(result, release)
     }
 
     fn keypress(&mut self, names: &[String]) -> Result<(), CuError> {
@@ -395,16 +408,23 @@ impl X11Backend {
         Ok(())
     }
 
-    fn drag(&self, path: &[Point], viewport: Viewport) -> Result<(), CuError> {
+    fn drag(
+        &mut self,
+        path: &[Point],
+        viewport: Viewport,
+        hold_ms: u64,
+        duration_ms: Option<u64>,
+    ) -> Result<(), CuError> {
         self.move_pointer(path[0], viewport)?;
-        self.button_event(1, true)?;
-        let result = path[1..].iter().try_for_each(|point| {
-            self.move_pointer(*point, viewport)?;
-            thread::sleep(DRAG_DELAY);
-            Ok(())
-        });
-        let release = self.button_event(1, false);
-        result.and(release)
+        with_held_button(
+            self,
+            |this, down| this.button_event(1, down),
+            |this| {
+                drag_path(path, hold_ms, duration_ms, |point| {
+                    this.move_pointer(point, viewport)
+                })
+            },
+        )
     }
 }
 
@@ -447,18 +467,29 @@ impl Desktop for X11Backend {
             Action::Move { x, y, keys } => self.execute_with_modifiers(keys, |this| {
                 this.move_pointer(Point { x: *x, y: *y }, viewport)
             }),
-            Action::Click { x, y, button, keys } => self.execute_with_modifiers(keys, |this| {
-                this.click(Point { x: *x, y: *y }, *button, viewport)
+            Action::Click {
+                x,
+                y,
+                button,
+                keys,
+                duration_ms,
+            } => self.execute_with_modifiers(keys, |this| {
+                this.click(Point { x: *x, y: *y }, *button, viewport, *duration_ms)
             }),
             Action::DoubleClick { x, y, keys } => self.execute_with_modifiers(keys, |this| {
                 let point = Point { x: *x, y: *y };
-                this.click(point, MouseButton::Left, viewport)?;
+                this.click(point, MouseButton::Left, viewport, 0)?;
                 thread::sleep(Duration::from_millis(60));
-                this.click(point, MouseButton::Left, viewport)
+                this.click(point, MouseButton::Left, viewport, 0)
             }),
-            Action::Drag { path, keys } => {
-                self.execute_with_modifiers(keys, |this| this.drag(path, viewport))
-            }
+            Action::Drag {
+                path,
+                keys,
+                hold_ms,
+                duration_ms,
+            } => self.execute_with_modifiers(keys, |this| {
+                this.drag(path, viewport, *hold_ms, *duration_ms)
+            }),
             Action::Scroll {
                 x,
                 y,
